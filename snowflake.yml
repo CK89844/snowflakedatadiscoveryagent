@@ -1,0 +1,20 @@
+definition_version: 2
+entities:
+  data_discovery_app:
+    type: streamlit
+    identifier:
+      name: DATA_DISCOVERY_APP
+      schema: CILLIAN_TEST
+      database: DATA_ENGINEERING_HOME
+    stage: CILLIAN_TEST.STREAMLIT_STAGE
+    query_warehouse: ENGINEERING_WH
+    main_file: streamlit_app.py
+    title: Data Discovery & Mapping
+    # Everything the app imports or reads at runtime must be listed so the
+    # Snowflake CLI uploads it to the stage alongside streamlit_app.py.
+    artifacts:
+      - streamlit_app.py
+      - cortex_agent.py
+      - service_codes.py
+      - environment.yml
+      - docs/how_it_works.html

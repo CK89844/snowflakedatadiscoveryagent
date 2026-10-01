@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Client Report AI Mapping Tool — How it works</title>
+<style>
+  :root{
+    --brand:#00654F; --brand-2:#0B6E4F; --accent:#00A870;
+    --ink:#14201B; --muted:#5A6B63; --faint:#8A998F;
+    --line:#D9E2DC; --bg:#F4F7F5; --card:#FFFFFF;
+    --gold-bg:#F5E4B0; --gold-bd:#E7C86A; --gold-ink:#7A5B00;
+    --silver-bg:#E6EAEE; --silver-bd:#C9D3DB; --silver-ink:#4A5A67;
+    --strat-bg:#DFF3E8; --strat-bd:#A9DCC4; --strat-ink:#0B6E4F;
+    --legacy-bg:#FBE6E1; --legacy-bd:#F1C2B4; --legacy-ink:#9A3412;
+  }
+  *{box-sizing:border-box;}
+  body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    color:var(--ink);background:var(--bg);line-height:1.5;}
+  .wrap{max-width:1180px;margin:0 auto;padding:2.4rem 1.6rem 4rem;}
+  header.top{display:flex;align-items:center;gap:.9rem;border-bottom:3px solid var(--brand);
+    padding-bottom:1rem;margin-bottom:1.6rem;}
+  .logo{width:44px;height:44px;border-radius:10px;background:var(--brand);color:#fff;
+    display:grid;place-items:center;font-weight:800;font-size:1.2rem;letter-spacing:-.02em;}
+  .titles h1{margin:0;font-size:1.5rem;letter-spacing:-.01em;}
+  .titles p{margin:.15rem 0 0;color:var(--muted);font-size:.92rem;font-weight:600;}
+  .lede{background:var(--card);border:1px solid var(--line);border-radius:14px;
+    padding:1.2rem 1.4rem;margin-bottom:2rem;font-size:1.02rem;color:#24352D;}
+  .lede b{color:var(--brand);}
+  h2.section{font-size:1.15rem;margin:2.4rem 0 1rem;padding-left:.7rem;
+    border-left:4px solid var(--accent);}
+  /* ---- Flow diagram ---- */
+  .flow{display:grid;grid-template-columns:repeat(5,1fr);gap:.6rem;align-items:stretch;}
+  .node{background:var(--card);border:1px solid var(--line);border-radius:14px;
+    padding:1rem .9rem;position:relative;box-shadow:0 1px 2px rgba(20,32,27,.04);}
+  .node .n{position:absolute;top:-12px;left:-12px;width:26px;height:26px;border-radius:50%;
+    background:var(--brand);color:#fff;display:grid;place-items:center;font-size:.8rem;font-weight:800;}
+  .node .ico{font-size:1.5rem;line-height:1;margin-bottom:.4rem;}
+  .node h3{margin:.1rem 0 .35rem;font-size:.98rem;}
+  .node p{margin:0;font-size:.82rem;color:var(--muted);}
+  .arrows{display:grid;grid-template-columns:repeat(5,1fr);gap:.6rem;margin:.35rem 0 .1rem;}
+  .arrows span{text-align:center;color:var(--accent);font-size:1.3rem;font-weight:800;}
+  .arrows span:last-child{visibility:hidden;}
+  /* ---- Engine detail ---- */
+  .engine{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:1.4rem;}
+  .steps{display:grid;grid-template-columns:1fr 1fr 1fr;gap:1rem;}
+  .step{border:1px solid var(--line);border-radius:12px;padding:1rem;background:#FBFDFC;}
+  .step .k{font-size:.72rem;font-weight:800;letter-spacing:.06em;color:var(--accent);text-transform:uppercase;}
+  .step h4{margin:.3rem 0 .4rem;font-size:.98rem;}
+  .step p{margin:0;font-size:.84rem;color:var(--muted);}
+  .step code{background:#EAF3EF;color:var(--brand-2);padding:.05rem .3rem;border-radius:5px;
+    font-size:.78rem;}
+  /* ---- Layer / source key ---- */
+  .cards{display:grid;grid-template-columns:1fr 1fr;gap:1rem;}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:1.1rem 1.2rem;}
+  .card h3{margin:.1rem 0 .6rem;font-size:1rem;}
+  .badge{display:inline-block;font-size:.66rem;font-weight:800;letter-spacing:.03em;
+    padding:.12rem .45rem;border-radius:999px;vertical-align:middle;margin-right:.3rem;}
+  .b-gold{background:var(--gold-bg);color:var(--gold-ink);border:1px solid var(--gold-bd);}
+  .b-silver{background:var(--silver-bg);color:var(--silver-ink);border:1px solid var(--silver-bd);}
+  .b-strat{background:var(--strat-bg);color:var(--strat-ink);border:1px solid var(--strat-bd);}
+  .b-legacy{background:var(--legacy-bg);color:var(--legacy-ink);border:1px solid var(--legacy-bd);}
+  .card ul{margin:.4rem 0 0;padding-left:1.1rem;}
+  .card li{font-size:.86rem;color:#2C3B34;margin:.25rem 0;}
+  .card li b{color:var(--ink);}
+  /* ---- Medallion strip ---- */
+  .medallion{display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:.6rem;margin-top:.4rem;}
+  .med{border-radius:12px;padding:.9rem;border:1px solid var(--line);}
+  .med.bronze{background:#F3E7DC;border-color:#E4CBB3;}
+  .med.silver{background:var(--silver-bg);border-color:var(--silver-bd);}
+  .med.gold{background:var(--gold-bg);border-color:var(--gold-bd);}
+  .med.report{background:#EAF3EF;border-color:#BFE0D5;}
+  .med h4{margin:0 0 .3rem;font-size:.9rem;}
+  .med p{margin:0;font-size:.78rem;color:#3B4A42;}
+  .med .tag{font-size:.66rem;font-weight:800;text-transform:uppercase;letter-spacing:.05em;
+    color:var(--muted);}
+  /* ---- Numbered explainer list ---- */
+  .walk{counter-reset:w;display:grid;gap:.7rem;}
+  .walk .row{display:flex;gap:.9rem;background:var(--card);border:1px solid var(--line);
+    border-radius:12px;padding:.9rem 1rem;}
+  .walk .row::before{counter-increment:w;content:counter(w);flex:0 0 28px;height:28px;
+    background:var(--brand);color:#fff;border-radius:50%;display:grid;place-items:center;
+    font-weight:800;font-size:.85rem;}
+  .walk .row div{font-size:.9rem;}
+  .walk .row b{color:var(--brand-2);}
+  .foot{margin-top:2.6rem;padding-top:1rem;border-top:1px solid var(--line);
+    color:var(--faint);font-size:.8rem;display:flex;justify-content:space-between;flex-wrap:wrap;gap:.5rem;}
+  .foot .brand{color:var(--brand-2);font-weight:700;}
+  @media print{body{background:#fff;} .node,.card,.engine,.walk .row{box-shadow:none;}}
+  @media (max-width:900px){
+    .flow,.arrows,.steps,.cards,.medallion{grid-template-columns:1fr;}
+    .arrows{display:none;}
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header class="top">
+    <div class="logo">L&amp;G</div>
+    <div class="titles">
+      <h1>Client Report AI Mapping Tool</h1>
+      <p>Asset Management Data Marketplace · How it works</p>
+    </div>
+  </header>
+
+  <div class="lede">
+    The tool takes a <b>legacy client report</b> (an Excel/CSV file of columns) and automatically
+    tells you <b>where each column lives in the new strategic data model</b> — matching on meaning,
+    value shape and example values, preferring the modern <b>GOLD</b> data products, falling back to
+    curated <b>SILVER</b> (EDW) tables, and making clear <b>which EDW service code</b> each SILVER
+    match is sourced from. It turns a slow, manual, expert-only mapping exercise into a reviewable
+    draft in seconds.
+  </div>
+
+  <!-- ============ HIGH-LEVEL FLOW ============ -->
+  <h2 class="section">The journey — from a legacy file to a reviewed mapping</h2>
+  <div class="flow">
+    <div class="node"><span class="n">1</span><div class="ico">📄</div>
+      <h3>Upload</h3><p>Drop in an Excel, CSV or delimited legacy report. Every column is profiled — name, type and sample values.</p></div>
+    <div class="node"><span class="n">2</span><div class="ico">🧠</div>
+      <h3>Understand</h3><p>The AI agent reads the business meaning of each column, expanding cryptic abbreviations (PTY→PARTY, CTRY→COUNTRY…).</p></div>
+    <div class="node"><span class="n">3</span><div class="ico">🔎</div>
+      <h3>Match</h3><p>It searches the whole catalogue of strategic columns — by meaning, value shape <i>and</i> example values — and ranks the best targets, GOLD first then SILVER.</p></div>
+    <div class="node"><span class="n">4</span><div class="ico">🏷️</div>
+      <h3>Label</h3><p>Each match shows the layer, a confidence score, how it was found (name, shape or value) and, for SILVER, the exact service code it maps to.</p></div>
+    <div class="node"><span class="n">5</span><div class="ico">✅</div>
+      <h3>Review &amp; save</h3><p>A person checks, overrides where needed, and saves the run to a searchable history.</p></div>
+  </div>
+  <div class="arrows"><span>→</span><span>→</span><span>→</span><span>→</span><span>→</span></div>
+
+  <!-- ============ THE MATCHING ENGINE ============ -->
+  <h2 class="section">Inside the match — how the AI finds the right target</h2>
+  <div class="engine">
+    <p style="margin:.1rem 0 1rem;color:var(--muted);font-size:.9rem;">
+      Matching is <b>grounded</b> — the AI can only choose from columns that actually exist in the
+      strategic model, so it never invents a table or column. It works in three passes:</p>
+    <div class="steps">
+      <div class="step">
+        <div class="k">Pass 1 · Retrieve</div>
+        <h4>Semantic search</h4>
+        <p>A <code>Cortex Search</code> service over the whole column catalogue finds the columns whose
+        <i>meaning</i> is closest to the legacy field. The query carries not just the name but its
+        expanded words, inferred <b>value shape</b> and a few <b>example values</b>, so content — not
+        just the name — drives retrieval.</p>
+      </div>
+      <div class="step">
+        <div class="k">Pass 2 · Re-rank</div>
+        <h4>Business rules</h4>
+        <p>Candidates are re-scored with hard signals: exact-name match, shared words, matching value
+        <b>shape</b> (ISIN, LEI, date…), real <b>overlap in example values</b>, a <b>GOLD-first</b>
+        preference and a <b>strategic-source</b> preference.</p>
+      </div>
+      <div class="step">
+        <div class="k">Pass 3 · Ground</div>
+        <h4>Confidence &amp; source</h4>
+        <p>The top target gets a 0–100% confidence, a basis (name / shape / value) and, if it's SILVER,
+        the EDW <b>service code</b> behind it. Every column keeps ranked alternates for the reviewer.</p>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============ THE TWO KEYS: LAYER & SOURCE ============ -->
+  <h2 class="section">The two things every match tells you</h2>
+  <div class="cards">
+    <div class="card">
+      <h3>1 · Which layer? <span class="badge b-gold">GOLD</span><span class="badge b-silver">SILVER</span></h3>
+      <ul>
+        <li><b><span class="badge b-gold">GOLD</span>Data products</b> — the modern, strategic model
+          (<code>DATA_PRODUCT_CORE</code>). <b>Always the preferred target.</b> No service code is shown
+          because the data product <i>is</i> the strategic source.</li>
+        <li><b><span class="badge b-silver">SILVER</span>Curated EDW</b> — well-governed enterprise tables
+          (<code>EDW_CORE</code>). Used when GOLD has no suitable column. Here the <b>service code matters</b>,
+          so it is always shown.</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h3>2 · Which source? <span class="badge b-strat">STRATEGIC</span><span class="badge b-legacy">LEGACY</span></h3>
+      <ul>
+        <li><b><span class="badge b-strat">STRATEGIC</span></b> service codes come from
+          <b>CRDEF, ADP, Fundipedia, Lipper</b> and <b>CRPM</b> — the go-forward sources.</li>
+        <li><b><span class="badge b-legacy">LEGACY</span></b> means the data is sourced from the old
+          <b>Phoenix</b> warehouse (e.g. QUASAR, SCOPE, BNYM, NT) — the same lineage as the report being
+          migrated <i>away</i> from.</li>
+        <li>When both exist for a field, the tool <b>prefers the strategic service code</b> and flags the
+          legacy one for a decision.</li>
+      </ul>
+    </div>
+  </div>
+
+  <!-- ============ MEDALLION CONTEXT ============ -->
+  <h2 class="section">Where this sits — the data journey it maps against</h2>
+  <div class="medallion">
+    <div class="med bronze"><span class="tag">Raw</span><h4>Bronze</h4>
+      <p>Untouched source feeds (<code>*_RAW</code>) landed from each system.</p></div>
+    <div class="med silver"><span class="tag">Curated</span><h4>Silver · EDW_CORE</h4>
+      <p>Cleaned, conformed enterprise tables. Carry service codes per source system.</p></div>
+    <div class="med gold"><span class="tag">Product</span><h4>Gold · DATA_PRODUCT_CORE</h4>
+      <p>Business-ready strategic data products. The primary mapping target.</p></div>
+    <div class="med report"><span class="tag">Consumer</span><h4>Legacy report</h4>
+      <p>The uploaded client report — what we are re-pointing onto Gold/Silver.</p></div>
+  </div>
+  <p style="color:var(--muted);font-size:.86rem;margin-top:.7rem;">
+    The tool answers the question: <b>“for each column in this old report, what is the equivalent in the
+    strategic model, and how confident are we?”</b></p>
+
+  <!-- ============ END-TO-END WALKTHROUGH ============ -->
+  <h2 class="section">A worked example, in plain English</h2>
+  <div class="walk">
+    <div class="row"><div>A report column <b>CTRY_OF_DOMICILE</b> is uploaded. The tool expands
+      “CTRY” to “COUNTRY” and reads its sample values (GB, US, FR…).</div></div>
+    <div class="row"><div>Semantic search finds country-related columns across the whole model; re-ranking
+      spots <b>DATA_PRODUCT_CORE.SECURITY.DOMICILE_CNTRY_CD</b> as the closest — helped by the sample
+      values (GB, US, FR…) <b>overlapping</b> that column's own example values.</div></div>
+    <div class="row"><div>It's a <b><span class="badge b-gold">GOLD</span></b> data product, so it's preferred and
+      the source is left blank (strategic by definition). Confidence: <b>92%</b> → <b>mapped</b>.</div></div>
+    <div class="row"><div>A rating column <b>RTG_MOODY_SEN_SECURED</b> has no GOLD equivalent, so it maps to
+      <b><span class="badge b-silver">SILVER</span> EDW_CORE.PARTY.RTG_MOODY_SEN_SEC</b>, sourced from
+      service code <b>CRDEF</b> — shown as <b><span class="badge b-strat">CRDEF</span></b>.</div></div>
+    <div class="row"><div>The reviewer scans confidence and source badges, overrides anything that looks off,
+      then <b>saves the run</b> — creating an auditable record others can revisit.</div></div>
+  </div>
+
+  <!-- ============ WHY IT MATTERS ============ -->
+  <h2 class="section">Why it matters</h2>
+  <div class="cards">
+    <div class="card"><h3>Speed</h3>
+      <p style="margin:0;font-size:.88rem;color:#2C3B34;">Hundreds of columns are drafted in seconds instead
+      of days of manual lookup by a scarce subject-matter expert.</p></div>
+    <div class="card"><h3>Consistency &amp; trust</h3>
+      <p style="margin:0;font-size:.88rem;color:#2C3B34;">Every suggestion is grounded in the real catalogue,
+      GOLD-first, with a confidence score, a clear source, and a saved history for audit.</p></div>
+  </div>
+
+  <div class="foot">
+    <span>Client Report AI Mapping Tool · powered by Snowflake Cortex</span>
+    <span class="brand">Asset Management Data Marketplace</span>
+  </div>
+
+</div>
+</body>
+</html>

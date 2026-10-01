@@ -1,0 +1,22 @@
+# Local development Streamlit config.
+# The file_uploader posts to the server via a separate request; inside the
+# VS Code Simple Browser (and some proxies) Streamlit's XSRF/CORS checks reject
+# that upload with a 403. Disabling them for LOCAL dev fixes the upload.
+# Do NOT copy these relaxed settings to a shared/production deployment.
+
+[server]
+enableXsrfProtection = false
+enableCORS = false
+headless = true
+
+[browser]
+gatherUsageStats = false
+
+# Legal & General brand theme — light enterprise (applied to native widgets).
+[theme]
+base = "light"
+primaryColor = "#00654F"
+backgroundColor = "#F5F7F8"
+secondaryBackgroundColor = "#FFFFFF"
+textColor = "#14201B"
+font = "sans serif"
