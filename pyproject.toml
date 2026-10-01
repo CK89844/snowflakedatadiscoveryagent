@@ -1,0 +1,14 @@
+[project]
+name = "report-mapping-tool"
+version = "1.0.0"
+description = "Report attribute mapping tool (Streamlit-in-Snowflake, container runtime)"
+requires-python = ">=3.11"
+# Resolved from the account's attached artifact repository
+# (SNOWFLAKE.SNOWPARK.PYPI_SHARED_REPOSITORY) — an internal PyPI mirror, so no
+# External Access Integration / public internet is required.
+dependencies = [
+    "streamlit>=1.48.0",
+    "pandas",
+    "openpyxl",
+    "snowflake-snowpark-python",
+]

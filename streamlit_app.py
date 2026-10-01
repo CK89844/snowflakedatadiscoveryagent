@@ -407,6 +407,7 @@ def inject_css() -> None:
             vertical-align:middle; margin-left:.25rem; }
         .layer-badge.gold { background:#F5E4B0; color:#7A5B00; border:1px solid #E7C86A; }
         .layer-badge.silver { background:#E6EAEE; color:#4A5A67; border:1px solid #C9D3DB; }
+        .layer-badge.bronze { background:#EFD9C2; color:#7A4A1E; border:1px solid #D8B48C; }
         .basis-badge { display:inline-block; font-size:.6rem; font-weight:700;
             padding:.06rem .34rem; border-radius:999px; vertical-align:middle;
             margin-left:.25rem; background:#EAF3F0; color:#0B6E4F; border:1px solid #BFE0D5; }
@@ -612,13 +613,19 @@ def ensure_history_tables(_session) -> bool:
                 TARGET_OBJECT STRING, TARGET_COLUMN STRING,
                 CONFIDENCE NUMBER, MATCH_BASIS STRING, STATUS STRING,
                 IS_OVERRIDE BOOLEAN DEFAULT FALSE, CANDIDATES STRING,
-                RATIONALE STRING, REVIEWED_BY STRING, REVIEWED_AT TIMESTAMP_NTZ
+                RATIONALE STRING, FOUND_IN STRING, DISPOSITION STRING,
+                OWNER STRING, DECISION STRING, NOTES STRING,
+                REVIEWED_BY STRING, REVIEWED_AT TIMESTAMP_NTZ
             )"""
         ).collect()
-        # Defensive: add CANDIDATES to any table created before this column existed.
-        _session.sql(
-            f"ALTER TABLE {RESULT_TBL} ADD COLUMN IF NOT EXISTS CANDIDATES STRING"
-        ).collect()
+        # Defensive: add newer columns to any table created before they existed.
+        for _col in (
+            "CANDIDATES STRING", "FOUND_IN STRING", "DISPOSITION STRING",
+            "OWNER STRING", "DECISION STRING", "NOTES STRING",
+        ):
+            _session.sql(
+                f"ALTER TABLE {RESULT_TBL} ADD COLUMN IF NOT EXISTS {_col}"
+            ).collect()
         return True
     except Exception as exc:  # noqa: BLE001
         st.warning(f"Could not provision history tables: {exc}")
@@ -649,6 +656,46 @@ def map_status(confidence, target_column) -> str:
     if c >= 50:
         return "review"
     return "unmapped"
+
+
+# Four-tier medallion disposition. Maps the layer a column was found in to the
+# business action required to make it usable in the strategic model.
+_LAYER_FOUND_IN = {
+    "GOLD": "Data Product",
+    "SILVER": "EDW",
+    "BRONZE": "Raw",
+}
+
+# Decision values a reviewer can set on each action-register row.
+DECISION_VALUES = [
+    "Pending", "Accept", "Promote", "Curate", "Source externally", "Reject",
+]
+
+
+def _found_in(layer) -> str:
+    """Human label for the layer a column's match was found in (or Not found)."""
+    return _LAYER_FOUND_IN.get(str(layer or "").strip().upper(), "Not found")
+
+
+def _disposition(layer, target_column, status) -> str:
+    """The action implied by where (and whether) a column was matched.
+
+    GOLD   -> already in a Data Product, use it.
+    SILVER -> in EDW; decide whether to promote it into a Data Product.
+    BRONZE -> only in raw; must be curated up to EDW + Data Product.
+    none   -> not in Snowflake at all; must be sourced externally.
+    """
+    tgt = str(target_column or "").strip().lower()
+    lyr = str(layer or "").strip().upper()
+    if not tgt or tgt == "none" or status == "unmapped":
+        return "Source externally"
+    if lyr == "GOLD":
+        return "Use (Data Product)"
+    if lyr == "SILVER":
+        return "Promote to Data Product"
+    if lyr == "BRONZE":
+        return "Curate to EDW + Data Product"
+    return "Source externally"
 
 
 def save_mapping_run(session, report_name: str, source_file: str,
@@ -698,6 +745,11 @@ def save_mapping_run(session, report_name: str, source_file: str,
                     _sql_str(status), is_override,
                     _sql_str(cand_json),
                     _sql_str(r.get("rationale", "")),
+                    _sql_str(r.get("found_in", "")),
+                    _sql_str(r.get("disposition", "")),
+                    _sql_str(r.get("owner", "")),
+                    _sql_str(r.get("decision", "Pending")),
+                    _sql_str(r.get("notes", "")),
                 ]) + ")"
             )
         if values:
@@ -705,7 +757,8 @@ def save_mapping_run(session, report_name: str, source_file: str,
                 f"INSERT INTO {RESULT_TBL} (RUN_ID, COL_ORDER, LEGACY_COLUMN, "
                 "LEGACY_DTYPE, SAMPLE_VALUES, TARGET_LAYER, TARGET_OBJECT, "
                 "TARGET_COLUMN, CONFIDENCE, MATCH_BASIS, STATUS, IS_OVERRIDE, "
-                "CANDIDATES, RATIONALE) VALUES " + ", ".join(values)
+                "CANDIDATES, RATIONALE, FOUND_IN, DISPOSITION, OWNER, DECISION, "
+                "NOTES) VALUES " + ", ".join(values)
             ).collect()
         list_mapping_runs.clear()  # new run must appear in Historic Runs
         st.session_state.pop("_runs_cache", None)
@@ -1564,7 +1617,7 @@ def render_cards(df: pd.DataFrame) -> None:
         )
         layer = str(row.get("layer", "") or "").upper()
         layer_html = ""
-        if layer in ("GOLD", "SILVER"):
+        if layer in ("GOLD", "SILVER", "BRONZE"):
             layer_html = f'<span class="layer-badge {layer.lower()}">{layer}</span>'
         basis = str(row.get("match_basis", "") or "").lower()
         basis_html = (
@@ -2097,7 +2150,7 @@ def render_mapping_grid(df: pd.DataFrame) -> None:
             attr = '<div class="col-attr none">No match</div>'
         ds = _html.escape(str(r["target_view"]).strip() or "—")
         layer = str(r.get("layer", "") or "").upper()
-        if layer in ("GOLD", "SILVER"):
+        if layer in ("GOLD", "SILVER", "BRONZE"):
             ds += f' <span class="layer-badge {layer.lower()}">{layer}</span>'
         basis = str(r.get("match_basis", "") or "").lower()
         if basis in ("value", "pattern"):
@@ -2204,6 +2257,11 @@ def attach_candidates(session, mapping: pd.DataFrame) -> pd.DataFrame:
         map_status(r["confidence"], r["target_attribute"])
         for _, r in mapping.iterrows()
     ]
+    mapping["found_in"] = [_found_in(r.get("layer", "")) for _, r in mapping.iterrows()]
+    mapping["disposition"] = [
+        _disposition(r.get("layer", ""), r.get("target_attribute", ""), r.get("status", ""))
+        for _, r in mapping.iterrows()
+    ]
     return mapping
 
 
@@ -2306,7 +2364,7 @@ def render_editable_mapping(mapping: pd.DataFrame, key: str) -> pd.DataFrame:
             tgt = '<span class="col-attr none">No match</span>'
         layer = str(r.get("layer", "") or "").upper()
         layer_html = (f'<span class="layer-badge {layer.lower()}">{layer}</span>'
-                      if layer in ("GOLD", "SILVER") else '<span class="dash">—</span>')
+                      if layer in ("GOLD", "SILVER", "BRONZE") else '<span class="dash">—</span>')
         # EDW source = the service code(s) only (GOLD data products carry none).
         # No strategic/legacy wording here — this column is just the source code.
         src_label = _src_summary(r)
@@ -2372,7 +2430,8 @@ def render_editable_mapping(mapping: pd.DataFrame, key: str) -> pd.DataFrame:
                 key=f"{key}_ov_legacy",
             )
             layer_filter = r1[1].selectbox(
-                "Layer", options=["All", "GOLD", "SILVER"], key=f"{key}_ov_layer",
+                "Layer", options=["All", "GOLD", "SILVER", "BRONZE"],
+                key=f"{key}_ov_layer",
                 help="Filter the object list. GOLD (data products) is preferred.",
                 on_change=_reset_obj_col,
             )
@@ -2545,8 +2604,32 @@ def run_mapping_flow(uploaded, key_prefix: str, show_delimiter: bool = True) -> 
         unsafe_allow_html=True,
     )
 
+    # ---- Four-tier gap analysis (where was each column found?) -------------
+    found = mapping.get("found_in", pd.Series(["Not found"] * len(mapping)))
+    n_dp = int((found == "Data Product").sum())
+    n_edw = int((found == "EDW").sum())
+    n_raw = int((found == "Raw").sum())
+    n_none = int((found == "Not found").sum())
     st.markdown(
-        '<div class="subhead">Attribute Mapping (GOLD &rarr; SILVER)</div>',
+        '<div class="metric-row">'
+        f'<div class="metric-card"><div class="label">In Data Product</div><div class="value good">{n_dp}</div></div>'
+        f'<div class="metric-card"><div class="label">In EDW</div><div class="value">{n_edw}</div></div>'
+        f'<div class="metric-card"><div class="label">In Raw</div><div class="value warn">{n_raw}</div></div>'
+        f'<div class="metric-card"><div class="label">Not in Snowflake</div><div class="value bad">{n_none}</div></div>'
+        '</div>',
+        unsafe_allow_html=True,
+    )
+    gaps = []
+    if n_edw:
+        gaps.append(f"**{n_edw}** in EDW — decide whether to promote to a Data Product")
+    if n_raw:
+        gaps.append(f"**{n_raw}** only in Raw — curate up to EDW + Data Product")
+    if n_none:
+        gaps.append(f"**{n_none}** not found in Snowflake — source externally")
+    if gaps:
+        st.info("Action needed — " + "  ·  ".join(gaps))
+    st.markdown(
+        '<div class="subhead">Attribute Mapping (GOLD &rarr; SILVER &rarr; BRONZE)</div>',
         unsafe_allow_html=True,
     )
     st.caption(
@@ -2584,6 +2667,46 @@ def run_mapping_flow(uploaded, key_prefix: str, show_delimiter: bool = True) -> 
                     st.dataframe(alt, hide_index=True, use_container_width=True)
                 else:
                     st.caption("No catalogue candidates found — map manually above.")
+
+    # ---- Actionable review register ---------------------------------------
+    st.markdown('<div class="subhead">Action register</div>', unsafe_allow_html=True)
+    st.caption(
+        "One row per report attribute with the action required. Set an Owner, a "
+        "Decision and Notes — these save with the run and export to CSV."
+    )
+    reg = pd.DataFrame({
+        "Report Attribute": mapping["legacy_attribute"],
+        "Found In": mapping.get("found_in", ""),
+        "Target": [
+            (f"{o}.{c}" if str(c or "").strip() and str(c).lower() != "none" else "—")
+            for o, c in zip(mapping.get("target_view", ""), mapping.get("target_attribute", ""))
+        ],
+        "Confidence": pd.to_numeric(mapping["confidence"], errors="coerce").fillna(0).astype(int),
+        "Disposition": mapping.get("disposition", ""),
+        "Owner": mapping.get("owner", ""),
+        "Decision": mapping.get("decision", "Pending").fillna("Pending")
+        if "decision" in mapping else ["Pending"] * len(mapping),
+        "Notes": mapping.get("notes", ""),
+    })
+    reg_edited = st.data_editor(
+        reg,
+        key=f"{key_prefix}_register",
+        hide_index=True,
+        use_container_width=True,
+        disabled=["Report Attribute", "Found In", "Target", "Confidence", "Disposition"],
+        column_config={
+            "Decision": st.column_config.SelectboxColumn(
+                "Decision", options=DECISION_VALUES, required=True, width="small",
+            ),
+            "Owner": st.column_config.TextColumn("Owner", width="small"),
+            "Notes": st.column_config.TextColumn("Notes", width="large"),
+        },
+    )
+    # Fold reviewer inputs back onto the mapping so they persist + export.
+    mapping["owner"] = reg_edited["Owner"].values
+    mapping["decision"] = reg_edited["Decision"].values
+    mapping["notes"] = reg_edited["Notes"].values
+    st.session_state["mapping"] = mapping
 
     # ---- Save to history + export -----------------------------------------
     c1, c2 = st.columns([1, 1])

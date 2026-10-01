@@ -32,14 +32,18 @@ STAGE = "STREAMLIT_STAGE"
 MAIN_FILE = "streamlit_app.py"
 # Container-based (SPCS) Streamlit runs on a compute pool, not a warehouse.
 # The query warehouse is still used for the SQL the app issues.
-COMPUTE_POOL = "STREAMLIT_ENGINEERING_COMPUTE_POOL"
+COMPUTE_POOL = "CORTEX_STREAMLIT_COMPUTE_POOL"
 
 # (local relative path, stage sub-path).  '' = stage root.
+# Container (vNext) Streamlit on a compute pool resolves packages via pip from
+# the account's attached artifact repository (SNOWFLAKE.SNOWPARK.PYPI_SHARED_
+# REPOSITORY) using pyproject.toml — no public internet / EAI required. The
+# warehouse-only environment.yml must NOT be present (it conflicts with vNext).
 FILES = [
     ("streamlit_app.py", ""),
     ("cortex_agent.py", ""),
     ("service_codes.py", ""),
-    ("environment.yml", ""),
+    ("pyproject.toml", ""),
     ("docs/how_it_works.html", "docs"),
 ]
 
@@ -100,6 +104,13 @@ def main() -> int:
     print(f"Stage: {STAGE}")
     if apply:
         session.sql(stage_sql).collect()
+        # environment.yml is warehouse-runtime only and breaks vNext/container
+        # apps — strip it so the container resolves from pyproject.toml.
+        try:
+            session.sql(f"REMOVE @{STAGE}/environment.yml").collect()
+            print("  Removed stale environment.yml from stage")
+        except Exception as exc:  # noqa: BLE001
+            print(f"  environment.yml cleanup note: {str(exc)[:120]}")
 
     # 2) Upload files ----------------------------------------------------------
     print("\nUploading files:")
@@ -115,29 +126,11 @@ def main() -> int:
         print(f"\nERROR: missing files, aborting: {missing}")
         return 2
 
-    # 3) Compute pool must be RESUMED and grantable so the container runtime is
-    #    actually used. If it's suspended / the role lacks USAGE, Snowflake
-    #    silently falls back to the warehouse (legacy) runtime.
-    print(f"\nCompute pool: {COMPUTE_POOL}")
-    if apply:
-        try:
-            session.sql(
-                f"ALTER COMPUTE POOL {COMPUTE_POOL} RESUME"
-            ).collect()
-            print("  RESUME requested")
-        except Exception as exc:  # noqa: BLE001 — already running is fine
-            print(f"  RESUME note: {str(exc)[:160]}")
-        try:
-            session.sql(
-                f"GRANT USAGE ON COMPUTE POOL {COMPUTE_POOL} TO ROLE {role}"
-            ).collect()
-            print(f"  Granted USAGE on pool to {role}")
-        except Exception as exc:  # noqa: BLE001
-            print(f"  GRANT note: {str(exc)[:160]}")
-
-    # 4) Streamlit object (container runtime — COMPUTE_POOL, no legacy fallback)
-    #    vNext/container apps use `FROM '@stage'` (a versioned/directory stage),
-    #    NOT ROOT_LOCATION (which is warehouse-runtime only).
+    # 3) Container (vNext) runtime on a compute pool. vNext apps MUST use
+    #    FROM '@stage' (a directory/versioned stage), NOT ROOT_LOCATION (which
+    #    is warehouse-runtime only and is rejected by vNext). Packages resolve
+    #    via pip from the account's attached PyPI artifact repository using
+    #    pyproject.toml — no public internet / EAI required.
     st_sql = (
         f"CREATE OR REPLACE STREAMLIT {APP_NAME} "
         f"FROM '@{db}.{schema}.{STAGE}' "
@@ -146,7 +139,7 @@ def main() -> int:
         f"QUERY_WAREHOUSE = {wh} "
         "TITLE = 'Report Mapping Tool'"
     )
-    print(f"\nStreamlit object: {APP_NAME}")
+    print(f"\nStreamlit object (container/compute pool): {APP_NAME}")
     print(f"  {st_sql}")
     if apply:
         session.sql(st_sql).collect()
@@ -157,26 +150,12 @@ def main() -> int:
     if apply:
         session.sql(grant_sql).collect()
 
-    # 6) Verify it really landed on the compute pool ---------------------------
+    # 6) Verify it landed ------------------------------------------------------
     if apply:
-        pool = ""
-        try:
-            for r in session.sql(f"DESCRIBE STREAMLIT {APP_NAME}").collect():
-                d = {k.lower(): v for k, v in r.as_dict().items()}
-                pool = d.get("compute_pool") or pool
-        except Exception as exc:  # noqa: BLE001
-            print(f"  DESCRIBE note: {str(exc)[:160]}")
         rows = session.sql(f"SHOW STREAMLITS LIKE '{APP_NAME}'").collect()
         url_id = rows[0].as_dict().get("url_id") if rows else ""
-        print(f"\nRuntime compute_pool = {pool or '(none — WAREHOUSE fallback!)'}")
-        if not pool:
-            print(
-                "\nERROR: the app did NOT bind to the compute pool — it is on the "
-                "warehouse runtime. Check that the role can USE the pool and that "
-                "it is RESUMED, then re-run."
-            )
-            session.close()
-            return 3
+        print(f"\nRuntime: container on compute pool {COMPUTE_POOL} "
+              f"(query warehouse {wh}).")
         print("Snowsight URL name:", url_id)
         print(f"\nDone. Open Snowsight > Projects > Streamlit > {APP_NAME}.")
     else:

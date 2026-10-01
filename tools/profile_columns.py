@@ -46,8 +46,16 @@ ROOT = Path(__file__).resolve().parents[1]
 SECRETS = ROOT / ".streamlit" / "secrets.toml"
 INVENTORY = Path(__file__).resolve().parent / "core_inventory.json"
 OUT = Path(__file__).resolve().parent / "core_profile.json"
+EXCLUDED = Path(__file__).resolve().parent / "profile_excluded.json"
+PROGRESS = Path(__file__).resolve().parent / "profile_progress.json"
 
-# Only profile the two canonical curated layers.
+# Skip tables above this row count — they are too slow to sample and are logged
+# to profile_excluded.json instead. Override with --max-rows N.
+MAX_ROWS = 50_000_000
+
+# Profile the curated layers plus any raw (Bronze) schema discovered by the
+# inventory (DATA_MARKETPLACE.*_RAW). The curated pair is listed explicitly; raw
+# schemas are matched dynamically by the is_raw flag / _RAW suffix below.
 CANONICAL = {
     ("DATA_MARKETPLACE", "DATA_PRODUCT_CORE"),  # Gold
     ("DATA_MARKETPLACE", "EDW_CORE"),            # Silver
@@ -140,7 +148,8 @@ def canonical_tables() -> list[dict]:
     inv = json.loads(INVENTORY.read_text(encoding="utf-8"))
     tables = []
     for meta in inv.values():
-        if (meta["database"], meta["schema"]) in CANONICAL:
+        is_raw = bool(meta.get("is_raw")) or str(meta.get("schema", "")).upper().endswith("_RAW")
+        if (meta["database"], meta["schema"]) in CANONICAL or is_raw:
             tables.append(meta)
     tables.sort(key=lambda m: (m["schema"], m["table"]))
     return tables
@@ -273,21 +282,39 @@ def profile_table(session: Session, meta: dict) -> dict:
 
 def main() -> int:
     apply = "--apply" in sys.argv
+    resume = "--resume" in sys.argv
     max_tables = None
     if "--max-tables" in sys.argv:
         max_tables = int(sys.argv[sys.argv.index("--max-tables") + 1])
+    max_rows = MAX_ROWS
+    if "--max-rows" in sys.argv:
+        max_rows = int(sys.argv[sys.argv.index("--max-rows") + 1])
 
     tables = canonical_tables()
     if max_tables:
         tables = tables[:max_tables]
     total_cols = sum(len(t["columns"]) for t in tables)
-    print(f"Canonical tables to profile: {len(tables)}  (~{total_cols} columns)")
+    print(f"Candidate tables: {len(tables)}  (~{total_cols} columns)  skip > {max_rows:,} rows")
     for t in tables[:5]:
-        print(f"  e.g. {t['schema']}.{t['table']} ({len(t['columns'])} cols) as-of={pick_as_of(t['columns'])}")
+        rc = t.get("row_count")
+        print(f"  e.g. {t['schema']}.{t['table']} ({len(t['columns'])} cols) "
+              f"rows={rc if rc is not None else '?'} as-of={pick_as_of(t['columns'])}")
 
     if not apply:
         print("\nDRY RUN. Re-run with --apply to profile.")
         return 0
+
+    # Resume: load any existing profile and skip tables already fully present.
+    profile: dict[str, dict] = {}
+    done_tables: set[str] = set()
+    if resume and OUT.exists():
+        try:
+            profile = json.loads(OUT.read_text(encoding="utf-8"))
+            done_tables = {".".join(k.split(".")[:2]) for k in profile}
+            print(f"Resuming: {len(profile)} column profiles already present "
+                  f"across {len(done_tables)} tables.")
+        except Exception:  # noqa: BLE001
+            profile, done_tables = {}, set()
 
     conn = load_conn()
     print(f"\nConnecting as {conn.get('user')} ...")
@@ -296,21 +323,66 @@ def main() -> int:
     # Guard: no single profiling query may run longer than this.
     session.sql("ALTER SESSION SET STATEMENT_TIMEOUT_IN_SECONDS = 120").collect()
 
-    profile: dict[str, dict] = {}
+    excluded: list[dict] = []
+
+    def write_progress(idx: int, current: str) -> None:
+        PROGRESS.write_text(json.dumps({
+            "done": idx,
+            "total": len(tables),
+            "current": current,
+            "profiled_columns": len(profile),
+            "excluded": excluded,
+        }, indent=2, default=str), encoding="utf-8")
+
     for n, meta in enumerate(tables, 1):
         schema, table = meta["schema"], meta["table"]
-        print(f"[{n}/{len(tables)}] profiling {schema}.{table} ...", flush=True)
+        key = f"{schema}.{table}"
+        row_count = meta.get("row_count")
+
+        # Skip tables above the row ceiling — too slow to sample. Log + continue.
+        if isinstance(row_count, int) and row_count > max_rows:
+            print(f"[{n}/{len(tables)}] SKIP {key} — {row_count:,} rows > {max_rows:,}")
+            excluded.append({
+                "table": key, "row_count": row_count,
+                "bytes": meta.get("bytes"), "reason": f"row_count > {max_rows}",
+            })
+            write_progress(n, key)
+            continue
+
+        # Resume: skip tables already profiled in a prior run.
+        if resume and key in done_tables:
+            print(f"[{n}/{len(tables)}] skip {key} (already profiled)")
+            write_progress(n, key)
+            continue
+
+        print(f"[{n}/{len(tables)}] profiling {key} "
+              f"(rows={row_count if row_count is not None else '?'}) ...", flush=True)
+        write_progress(n, key)
         try:
             cols = profile_table(session, meta)
         except Exception as exc:  # noqa: BLE001
             print(f"    ! table failed: {exc}")
+            excluded.append({
+                "table": key, "row_count": row_count,
+                "bytes": meta.get("bytes"), "reason": f"error: {str(exc)[:160]}",
+            })
             cols = {}
         for col, fp in cols.items():
             profile[f"{schema}.{table}.{col}"] = fp
         # Incremental save so a long run is resumable/inspectable.
         OUT.write_text(json.dumps(profile, indent=2, default=str), encoding="utf-8")
+        EXCLUDED.write_text(json.dumps(excluded, indent=2, default=str), encoding="utf-8")
 
+    EXCLUDED.write_text(json.dumps(excluded, indent=2, default=str), encoding="utf-8")
+    write_progress(len(tables), "DONE")
     print(f"\nWrote {len(profile)} column profiles -> {OUT}")
+    print(f"Excluded {len(excluded)} tables -> {EXCLUDED}")
+    if excluded:
+        print("Excluded tables:")
+        for e in excluded:
+            rc = e.get("row_count")
+            print(f"  - {e['table']}  ({rc:,} rows)  {e['reason']}"
+                  if isinstance(rc, int) else f"  - {e['table']}  {e['reason']}")
     return 0
 
 

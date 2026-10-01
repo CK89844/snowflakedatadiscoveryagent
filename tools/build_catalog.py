@@ -39,10 +39,12 @@ CANONICAL = {
     ("DATA_MARKETPLACE", "DATA_PRODUCT_CORE"): "DATA_PRODUCT",
 }
 
-# Medallion layer per domain: Gold = data products, Silver = curated EDW.
+# Medallion layer per domain: Gold = data products, Silver = curated EDW,
+# Bronze = raw landing schemas (DATA_MARKETPLACE.*_RAW).
 LAYER_BY_DOMAIN = {
     "DATA_PRODUCT": ("GOLD", 1),
     "EDW": ("SILVER", 2),
+    "RAW": ("BRONZE", 3),
 }
 
 PROFILE = Path(__file__).resolve().parent / "core_profile.json"
@@ -94,9 +96,15 @@ def build_rows() -> list[dict]:
     inherited_count = 0
     for meta in inv.values():
         key = (meta["database"], meta["schema"])
-        if key not in CANONICAL:
+        # Curated layers are listed in CANONICAL; raw (Bronze) schemas are any
+        # DATA_MARKETPLACE.*_RAW schema flagged by the inventory.
+        is_raw = bool(meta.get("is_raw")) or str(meta["schema"]).upper().endswith("_RAW")
+        if key in CANONICAL:
+            domain = CANONICAL[key]
+        elif is_raw:
+            domain = "RAW"
+        else:
             continue
-        domain = CANONICAL[key]
         layer, layer_rank = LAYER_BY_DOMAIN.get(domain, ("", 9))
         schema = meta["schema"]
         table = meta["table"]
