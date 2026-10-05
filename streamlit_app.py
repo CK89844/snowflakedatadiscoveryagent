@@ -306,6 +306,8 @@ def inject_css() -> None:
             padding:.08rem .4rem; border-radius:6px; margin-right:.25rem; }
         .match-badge.value { background:#E4F0FB; color:#1F5F8B; border:1px solid #BCD9F0; }
         .match-badge.pattern { background:#EEEAF7; color:#5A4A8A; border:1px solid #D3C9EC; }
+        .match-badge.memory { background:#E9F7EF; color:#0B6E4F; border:1px solid #B6E3CB; }
+        .match-badge.manual { background:#F3EEE4; color:#7A5A1E; border:1px solid #E0D2B6; }
         .status-pill { display:inline-block; font-size:.62rem; font-weight:800; letter-spacing:.04em;
             text-transform:uppercase; padding:.12rem .5rem; border-radius:999px; }
         .status-pill.mapped { background:#DFF3E8; color:#0B6E4F; border:1px solid #A9DCC4; }
@@ -585,6 +587,7 @@ def agent_config() -> dict:
 HISTORY_SCHEMA = "DATA_ENGINEERING_HOME.CILLIAN_TEST"
 RUN_TBL = f"{HISTORY_SCHEMA}.MAPPING_RUN"
 RESULT_TBL = f"{HISTORY_SCHEMA}.MAPPING_RESULT"
+MEMORY_TBL = f"{HISTORY_SCHEMA}.MAPPING_MEMORY"
 
 
 @st.cache_resource(show_spinner=False)
@@ -626,6 +629,22 @@ def ensure_history_tables(_session) -> bool:
             _session.sql(
                 f"ALTER TABLE {RESULT_TBL} ADD COLUMN IF NOT EXISTS {_col}"
             ).collect()
+        # Confirmed-mapping memory: a house dictionary of human-approved
+        # mappings the retriever consults first, so the tool 'learns' from
+        # manual overrides on confirmed runs (see harvest_confirmed_mappings).
+        _session.sql(
+            f"""CREATE TABLE IF NOT EXISTS {MEMORY_TBL} (
+                NORM_NAME STRING NOT NULL,
+                LEGACY_NAME STRING,
+                TARGET_OBJECT STRING, TARGET_COLUMN STRING, TARGET_LAYER STRING,
+                SERVICE_CODES STRING, CLASSIFICATION STRING,
+                HIT_COUNT NUMBER DEFAULT 1,
+                SOURCE_RUN_ID STRING, CONFIRMED_BY STRING,
+                CONFIRMED_AT TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
+                UPDATED_AT TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
+                CONSTRAINT PK_MAPPING_MEMORY PRIMARY KEY (NORM_NAME, TARGET_OBJECT, TARGET_COLUMN)
+            )"""
+        ).collect()
         return True
     except Exception as exc:  # noqa: BLE001
         st.warning(f"Could not provision history tables: {exc}")
@@ -698,12 +717,61 @@ def _disposition(layer, target_column, status) -> str:
     return "Source externally"
 
 
+# Below this confidence a match carries too little evidence to present as an
+# answer. We leave the target blank (the column reads "No confident match" and
+# is dispositioned to source externally) but keep the ranked candidates in the
+# "suggested alternates" list, so a reviewer can still map it manually.
+WEAK_MATCH_FLOOR = 35
+
+
+def _match_reason(row) -> str:
+    """A short, human-readable explanation of why a target was (or wasn't) chosen.
+
+    Prefers the engine's own rationale; otherwise builds one from the evidence
+    signals (exact name / value overlap / semantic) and the layer, so every
+    mapped row can show *why* it was picked.
+    """
+    rationale = str(row.get("rationale", "") or "").strip()
+    tgt = str(row.get("target_attribute", "") or "").strip()
+    if not tgt or tgt.lower() == "none":
+        return rationale or "No confident match — map manually or source externally."
+    if rationale:
+        return rationale
+    basis = str(row.get("match_basis", "") or "").lower()
+    layer = str(row.get("layer", "") or "").upper()
+    try:
+        conf = int(float(row.get("confidence", 0)))
+    except (TypeError, ValueError):
+        conf = 0
+    if basis == "manual":
+        why = "Manually overridden to this target."
+    elif basis == "memory":
+        why = "Previously confirmed mapping — approved by a reviewer on an earlier run"
+    elif basis in ("both", "value", "pattern"):
+        how = {"both": "value content and shape",
+               "value": "value content",
+               "pattern": "value shape"}.get(basis, basis)
+        why = f"Matched on {how}"
+    else:
+        why = "Best semantic match in the catalogue"
+    if layer in ("GOLD", "SILVER", "BRONZE"):
+        why += f" ({layer})"
+    return f"{why} · {conf}% confidence."
+
+
 def save_mapping_run(session, report_name: str, source_file: str,
-                     row_count: int, mapping: pd.DataFrame) -> str | None:
-    """Persist a mapping run + its per-column results. Returns the RUN_ID."""
+                     row_count: int, mapping: pd.DataFrame,
+                     run_id: str | None = None) -> str | None:
+    """Persist a mapping run + its per-column results. Returns the RUN_ID.
+
+    Pass an existing ``run_id`` to update that run in place (same RUN_ID): the
+    run's counts are refreshed, its results are replaced, and CREATED_AT /
+    status are preserved. Omit it to create a brand-new run.
+    """
     if not ensure_history_tables(session):
         return None
-    run_id = uuid.uuid4().hex
+    is_update = bool(run_id)
+    run_id = run_id or uuid.uuid4().hex
 
     work = mapping.copy()
     work["confidence"] = pd.to_numeric(work["confidence"], errors="coerce").fillna(0)
@@ -717,14 +785,27 @@ def save_mapping_run(session, report_name: str, source_file: str,
     avg = int(round(work["confidence"].mean())) if len(work) else 0
 
     try:
-        session.sql(
-            f"INSERT INTO {RUN_TBL} (RUN_ID, REPORT_NAME, SOURCE_FILE, ROW_COUNT, "
-            "COLUMN_COUNT, MAPPED_COUNT, REVIEW_COUNT, UNMAPPED_COUNT, "
-            "AVG_CONFIDENCE, STATUS, CREATED_BY) SELECT "
-            f"{_sql_str(run_id)}, {_sql_str(report_name)}, {_sql_str(source_file)}, "
-            f"{int(row_count)}, {len(work)}, {mapped}, {review}, {unmapped}, {avg}, "
-            "'draft', CURRENT_USER()"
-        ).collect()
+        if is_update:
+            # Update the run header in place (keep RUN_ID, CREATED_AT, STATUS),
+            # then replace its result rows.
+            session.sql(
+                f"UPDATE {RUN_TBL} SET COLUMN_COUNT = {len(work)}, "
+                f"MAPPED_COUNT = {mapped}, REVIEW_COUNT = {review}, "
+                f"UNMAPPED_COUNT = {unmapped}, AVG_CONFIDENCE = {avg}, "
+                f"UPDATED_AT = CURRENT_TIMESTAMP() WHERE RUN_ID = {_sql_str(run_id)}"
+            ).collect()
+            session.sql(
+                f"DELETE FROM {RESULT_TBL} WHERE RUN_ID = {_sql_str(run_id)}"
+            ).collect()
+        else:
+            session.sql(
+                f"INSERT INTO {RUN_TBL} (RUN_ID, REPORT_NAME, SOURCE_FILE, ROW_COUNT, "
+                "COLUMN_COUNT, MAPPED_COUNT, REVIEW_COUNT, UNMAPPED_COUNT, "
+                "AVG_CONFIDENCE, STATUS, CREATED_BY) SELECT "
+                f"{_sql_str(run_id)}, {_sql_str(report_name)}, {_sql_str(source_file)}, "
+                f"{int(row_count)}, {len(work)}, {mapped}, {review}, {unmapped}, {avg}, "
+                "'draft', CURRENT_USER()"
+            ).collect()
 
         values = []
         for order, ((_, r), status) in enumerate(zip(work.iterrows(), statuses)):
@@ -760,7 +841,8 @@ def save_mapping_run(session, report_name: str, source_file: str,
                 "CANDIDATES, RATIONALE, FOUND_IN, DISPOSITION, OWNER, DECISION, "
                 "NOTES) VALUES " + ", ".join(values)
             ).collect()
-        list_mapping_runs.clear()  # new run must appear in Historic Runs
+        list_mapping_runs.clear()  # new/updated run must refresh in Historic Runs
+        load_mapping_run.clear()   # reopened run must reflect the saved edits
         st.session_state.pop("_runs_cache", None)
         return run_id
     except Exception as exc:  # noqa: BLE001
@@ -787,30 +869,229 @@ def list_mapping_runs(_session, limit: int = 100) -> pd.DataFrame:
 
 @st.cache_data(show_spinner=False, ttl=300)
 def load_mapping_run(_session, run_id: str) -> pd.DataFrame:
-    """Return the per-column results for a saved run, in original order (cached)."""
+    """Return the per-column results for a saved run, in original order (cached).
+
+    Includes every field needed to re-open the run as a fully editable
+    workspace (candidates, disposition, owner/decision/notes, override flag).
+    """
     try:
         return _session.sql(
             "SELECT COL_ORDER, LEGACY_COLUMN, LEGACY_DTYPE, SAMPLE_VALUES, "
             "TARGET_LAYER, TARGET_OBJECT, TARGET_COLUMN, CONFIDENCE, MATCH_BASIS, "
-            f"STATUS, RATIONALE FROM {RESULT_TBL} WHERE RUN_ID = {_sql_str(run_id)} "
-            "ORDER BY COL_ORDER"
+            "STATUS, RATIONALE, IS_OVERRIDE, CANDIDATES, FOUND_IN, DISPOSITION, "
+            f"OWNER, DECISION, NOTES FROM {RESULT_TBL} "
+            f"WHERE RUN_ID = {_sql_str(run_id)} ORDER BY COL_ORDER"
         ).to_pandas()
     except Exception as exc:  # noqa: BLE001
         st.warning(f"Could not load run: {exc}")
         return pd.DataFrame()
 
 
+def _run_to_mapping(detail: pd.DataFrame) -> pd.DataFrame:
+    """Rebuild a saved run's result rows into the working mapping schema so a
+    historic run can be re-opened in the full editable workspace."""
+    def _cands(v):
+        try:
+            out = json.loads(v) if isinstance(v, str) and v.strip() else []
+            return out if isinstance(out, list) else []
+        except Exception:  # noqa: BLE001
+            return []
+
+    m = pd.DataFrame({
+        "legacy_attribute": detail.get("LEGACY_COLUMN", ""),
+        "legacy_dtype": detail.get("LEGACY_DTYPE", ""),
+        "samples_str": detail.get("SAMPLE_VALUES", ""),
+        "layer": detail.get("TARGET_LAYER", ""),
+        "target_view": detail.get("TARGET_OBJECT", ""),
+        "target_attribute": detail.get("TARGET_COLUMN", ""),
+        "confidence": pd.to_numeric(detail.get("CONFIDENCE", 0), errors="coerce").fillna(0).astype(int),
+        "match_basis": detail.get("MATCH_BASIS", ""),
+        "status": detail.get("STATUS", ""),
+        "rationale": detail.get("RATIONALE", ""),
+        "found_in": detail.get("FOUND_IN", ""),
+        "disposition": detail.get("DISPOSITION", ""),
+        "owner": detail.get("OWNER", ""),
+        "decision": detail.get("DECISION", "Pending"),
+        "notes": detail.get("NOTES", ""),
+        "source_label": "",
+        "classification": "",
+    })
+    m["is_override"] = (
+        detail["IS_OVERRIDE"].fillna(False).astype(bool)
+        if "IS_OVERRIDE" in detail else False
+    )
+    m["candidates"] = [
+        _cands(v) for v in (detail["CANDIDATES"] if "CANDIDATES" in detail else [""] * len(m))
+    ]
+    # Fill any NaNs so the editors/renderers behave.
+    for c in ("decision",):
+        m[c] = m[c].fillna("Pending")
+    # Decision must be one of the allowed options for the selectbox editor.
+    m["decision"] = m["decision"].apply(
+        lambda d: d if str(d).strip() in DECISION_VALUES else "Pending"
+    )
+    for c in ("legacy_dtype", "samples_str", "layer", "target_view",
+              "target_attribute", "match_basis", "status", "rationale",
+              "found_in", "disposition", "owner", "notes"):
+        m[c] = m[c].fillna("")
+    return m
+
+
 def update_run_status(session, run_id: str, status: str) -> None:
-    """Mark a run as draft/confirmed."""
+    """Mark a run as draft/confirmed.
+
+    Confirming a run also harvests its manual overrides into the confirmed-
+    mapping memory (the tool 'learns' from approved decisions). Reverting to
+    draft retracts any memory entries sourced from this run, so unconfirming
+    truly undoes the learning.
+    """
     try:
         session.sql(
             f"UPDATE {RUN_TBL} SET STATUS = {_sql_str(status)}, "
             f"UPDATED_AT = CURRENT_TIMESTAMP() WHERE RUN_ID = {_sql_str(run_id)}"
         ).collect()
+        if status == "confirmed":
+            harvest_confirmed_mappings(session, run_id)
+        elif status == "draft":
+            retract_run_memory(session, run_id)
         list_mapping_runs.clear()  # status badge must refresh in the list
+        load_confirmed_memory.clear()  # retriever must see the new/retracted memory
         st.session_state.pop("_runs_cache", None)
     except Exception as exc:  # noqa: BLE001
         st.error(f"Could not update status: {exc}")
+
+
+def delete_mapping_run(session, run_id: str) -> bool:
+    """Permanently delete a run (header + results) and retract its memory."""
+    try:
+        retract_run_memory(session, run_id)
+        session.sql(
+            f"DELETE FROM {RESULT_TBL} WHERE RUN_ID = {_sql_str(run_id)}"
+        ).collect()
+        session.sql(
+            f"DELETE FROM {RUN_TBL} WHERE RUN_ID = {_sql_str(run_id)}"
+        ).collect()
+        list_mapping_runs.clear()
+        load_mapping_run.clear()
+        load_confirmed_memory.clear()
+        st.session_state.pop("_runs_cache", None)
+        return True
+    except Exception as exc:  # noqa: BLE001
+        st.error(f"Could not delete run: {exc}")
+        return False
+
+
+def _norm_legacy_name(name: str) -> str:
+    """Normalise a legacy attribute name for memory lookup (alnum, upper)."""
+    return re.sub(r"[^a-z0-9]+", "", str(name or "").lower()).upper()
+
+
+def harvest_confirmed_mappings(session, run_id: str) -> int:
+    """Store a confirmed run's manual overrides in the mapping memory.
+
+    Only overridden rows with a real target are learned (a human explicitly
+    chose them). Upserts by normalised legacy name + target, bumping HIT_COUNT
+    when the same mapping is confirmed again. Returns the number learned.
+    """
+    if not ensure_history_tables(session):
+        return 0
+    try:
+        rows = session.sql(
+            "SELECT LEGACY_COLUMN, TARGET_OBJECT, TARGET_COLUMN, TARGET_LAYER "
+            f"FROM {RESULT_TBL} WHERE RUN_ID = {_sql_str(run_id)} "
+            "AND IS_OVERRIDE = TRUE AND NULLIF(TRIM(TARGET_COLUMN),'') IS NOT NULL"
+        ).collect()
+    except Exception:  # noqa: BLE001
+        return 0
+    learned = 0
+    for r in rows:
+        legacy = str(r["LEGACY_COLUMN"] or "")
+        norm = _norm_legacy_name(legacy)
+        obj = str(r["TARGET_OBJECT"] or "")
+        col = str(r["TARGET_COLUMN"] or "")
+        layer = str(r["TARGET_LAYER"] or "")
+        if not norm or not col:
+            continue
+        codes = _catalog_col_service(session).get((obj.upper(), col.upper()), "")
+        svc = _service_info(codes, layer)
+        try:
+            session.sql(
+                f"MERGE INTO {MEMORY_TBL} t USING (SELECT "
+                f"{_sql_str(norm)} AS NORM_NAME, {_sql_str(obj)} AS TARGET_OBJECT, "
+                f"{_sql_str(col)} AS TARGET_COLUMN) s "
+                "ON t.NORM_NAME = s.NORM_NAME AND t.TARGET_OBJECT = s.TARGET_OBJECT "
+                "AND t.TARGET_COLUMN = s.TARGET_COLUMN "
+                "WHEN MATCHED THEN UPDATE SET HIT_COUNT = t.HIT_COUNT + 1, "
+                f"SOURCE_RUN_ID = {_sql_str(run_id)}, CONFIRMED_BY = CURRENT_USER(), "
+                "UPDATED_AT = CURRENT_TIMESTAMP() "
+                "WHEN NOT MATCHED THEN INSERT (NORM_NAME, LEGACY_NAME, TARGET_OBJECT, "
+                "TARGET_COLUMN, TARGET_LAYER, SERVICE_CODES, CLASSIFICATION, "
+                "HIT_COUNT, SOURCE_RUN_ID, CONFIRMED_BY) VALUES ("
+                f"{_sql_str(norm)}, {_sql_str(legacy)}, {_sql_str(obj)}, "
+                f"{_sql_str(col)}, {_sql_str(layer)}, {_sql_str(svc['label'])}, "
+                f"{_sql_str(svc['classification'])}, 1, {_sql_str(run_id)}, CURRENT_USER())"
+            ).collect()
+            learned += 1
+        except Exception:  # noqa: BLE001
+            continue
+    return learned
+
+
+def retract_run_memory(session, run_id: str) -> None:
+    """Remove memory entries that were sourced from a given run."""
+    try:
+        session.sql(
+            f"DELETE FROM {MEMORY_TBL} WHERE SOURCE_RUN_ID = {_sql_str(run_id)}"
+        ).collect()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+@st.cache_data(show_spinner=False, ttl=300)
+def load_confirmed_memory(_session) -> dict:
+    """Return the confirmed-mapping memory keyed by normalised legacy name.
+
+    The best entry per name (most-confirmed, then most-recent) wins, so the
+    retriever can promote a previously-approved target as the top candidate.
+    """
+    try:
+        if not ensure_history_tables(_session):
+            return {}
+        df = _session.sql(
+            "SELECT NORM_NAME, TARGET_OBJECT, TARGET_COLUMN, TARGET_LAYER, "
+            "SERVICE_CODES, CLASSIFICATION, HIT_COUNT FROM "
+            f"{MEMORY_TBL} QUALIFY ROW_NUMBER() OVER (PARTITION BY NORM_NAME "
+            "ORDER BY HIT_COUNT DESC, UPDATED_AT DESC) = 1"
+        ).to_pandas()
+    except Exception:  # noqa: BLE001
+        return {}
+    out: dict = {}
+    for _, r in df.iterrows():
+        out[str(r["NORM_NAME"])] = {
+            "object": str(r["TARGET_OBJECT"] or ""),
+            "column": str(r["TARGET_COLUMN"] or ""),
+            "layer": str(r["TARGET_LAYER"] or "").upper(),
+            "source_label": str(r["SERVICE_CODES"] or ""),
+            "classification": str(r["CLASSIFICATION"] or ""),
+            "hits": int(r["HIT_COUNT"] or 1),
+        }
+    return out
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def _catalog_col_service(_session) -> dict:
+    """Map (OBJECT, COLUMN) -> service codes string, for memory enrichment."""
+    try:
+        df = _session.sql(
+            "SELECT PHYSICAL_OBJECT, COLUMN_NAME, COALESCE(SERVICE_CODES,'') AS SC "
+            f"FROM {CATALOG_FQN}"
+        ).to_pandas()
+    except Exception:  # noqa: BLE001
+        return {}
+    return {
+        (str(r["PHYSICAL_OBJECT"]).upper(), str(r["COLUMN_NAME"]).upper()): str(r["SC"] or "")
+        for _, r in df.iterrows()
+    }
 
 
 def _sniff_delimiter(sample: str) -> str:
@@ -839,17 +1120,150 @@ def _sniff_delimiter(sample: str) -> str:
     return best
 
 
-def read_report(uploaded, delimiter: str | None = None) -> pd.DataFrame:
+def _looks_non_tabular(df: pd.DataFrame | None) -> bool:
+    """Heuristic: did a naive read fail to find a real header/table?
+
+    Title banners, logos, merged cells and metadata rows push the real header
+    down, so pandas labels the columns ``Unnamed: N`` and/or leaves whole
+    columns empty. When that signature dominates we treat the sheet as
+    non-tabular and hand it to Cortex to reshape.
+    """
+    if df is None or df.shape[1] == 0 or df.shape[0] == 0:
+        return True
+    cols = [str(c) for c in df.columns]
+    unnamed = sum(1 for c in cols if c.startswith("Unnamed:"))
+    empty = sum(1 for c in df.columns if df[c].isna().all())
+    n = len(cols)
+    return (unnamed / n) >= 0.4 or (empty / n) >= 0.5
+
+
+def _pick_best_sheet(data: bytes) -> pd.DataFrame:
+    """Read every sheet raw (no header) and return the densest one."""
+    try:
+        sheets = pd.read_excel(BytesIO(data), header=None, sheet_name=None)
+    except Exception:  # noqa: BLE001
+        return pd.DataFrame()
+    best, best_score = pd.DataFrame(), -1
+    for _name, grid in sheets.items():
+        score = int(grid.notna().sum().sum())
+        if score > best_score:
+            best, best_score = grid, score
+    return best
+
+
+def _grid_preview(raw: pd.DataFrame, max_rows: int = 30, max_cols: int = 40,
+                  cell: int = 40) -> str:
+    """Serialise the top-left of a raw grid as numbered rows for the LLM."""
+    rows = []
+    for i in range(min(max_rows, raw.shape[0])):
+        vals = []
+        for j in range(min(max_cols, raw.shape[1])):
+            v = raw.iat[i, j]
+            s = "" if pd.isna(v) else str(v).replace("\n", " ").strip()
+            if len(s) > cell:
+                s = s[:cell]
+            vals.append(s)
+        rows.append(f"row {i}: " + " | ".join(vals))
+    return "\n".join(rows)
+
+
+def _clean_col(value, idx: int) -> str:
+    """Turn a raw header cell into a usable column name."""
+    s = "" if value is None or (isinstance(value, float) and pd.isna(value)) else str(value).strip()
+    return s if s and s.lower() != "nan" else f"col_{idx}"
+
+
+def reshape_excel_with_cortex(session, raw: pd.DataFrame) -> pd.DataFrame | None:
+    """Ask an in-database Cortex LLM to locate the real table in a messy sheet.
+
+    The model only returns row/column *coordinates* (header row, first data row,
+    column span) — it never invents data — so we then slice the raw grid into a
+    tidy DataFrame. Returns None if Cortex is unavailable or its answer can't be
+    parsed, so the caller can fall back to the naive read.
+    """
+    if session is None or raw is None or raw.empty:
+        return None
+    prompt = (
+        "You are a data-wrangling assistant. Below is the top-left region of a "
+        "spreadsheet, shown row by row with 0-based row numbers. Cells are "
+        "separated by ' | '. Identify the single rectangular table of records "
+        "(ignore title banners, logos, dates and notes).\n"
+        "Return ONLY strict JSON, no prose:\n"
+        '{"header_row": <int>, "first_data_row": <int>, "first_col": <int>, '
+        '"last_col": <int or null>}\n'
+        "- header_row: 0-based row containing the column names.\n"
+        "- first_data_row: 0-based row where data records begin.\n"
+        "- first_col / last_col: 0-based inclusive column span (last_col null = to the end).\n"
+        'If there is no tabular data, return {"header_row": null}.\n\n'
+        "GRID:\n" + _grid_preview(raw)
+    )
+    answer = _cortex_complete(session, prompt)
+    if not answer:
+        return None
+    m = re.search(r"\{.*\}", answer, re.DOTALL)
+    if not m:
+        return None
+    try:
+        meta = json.loads(m.group(0))
+    except Exception:  # noqa: BLE001
+        return None
+
+    hdr = meta.get("header_row")
+    if hdr is None:
+        return None
+    try:
+        hdr = int(hdr)
+        first_data = int(meta.get("first_data_row", hdr + 1))
+        first_col = int(meta.get("first_col") or 0)
+        last_col = meta.get("last_col")
+        last_col = int(last_col) if last_col is not None else None
+    except (TypeError, ValueError):
+        return None
+
+    if hdr < 0 or hdr >= raw.shape[0]:
+        return None
+    col_slice = slice(first_col, (last_col + 1) if last_col is not None else None)
+    sub = raw.iloc[:, col_slice]
+    header = sub.iloc[hdr].tolist()
+    body = sub.iloc[max(first_data, hdr + 1):].reset_index(drop=True)
+    body.columns = [_clean_col(h, k) for k, h in enumerate(header)]
+    # Drop fully empty rows/columns left by merged cells or trailing notes.
+    body = body.dropna(axis=1, how="all").dropna(axis=0, how="all").reset_index(drop=True)
+    return body if not body.empty else None
+
+
+def _read_excel_smart(data: bytes, session=None) -> pd.DataFrame:
+    """Read an Excel workbook, reshaping non-tabular sheets via Cortex."""
+    try:
+        df = pd.read_excel(BytesIO(data))
+    except Exception:  # noqa: BLE001
+        df = pd.DataFrame()
+
+    if not _looks_non_tabular(df):
+        return df
+
+    # Messy layout — hand the densest sheet to Cortex to locate the real table.
+    raw = _pick_best_sheet(data)
+    reshaped = reshape_excel_with_cortex(session, raw)
+    if reshaped is not None and not reshaped.empty:
+        st.session_state["_excel_reshaped"] = True
+        return reshaped
+    return df
+
+
+def read_report(uploaded, delimiter: str | None = None, session=None) -> pd.DataFrame:
     """Read an uploaded CSV or Excel file into a DataFrame.
 
     For delimited text we auto-detect the separator (comma, pipe, tab, etc.)
     so pipe-delimited legacy extracts are parsed into proper columns. Pass an
-    explicit `delimiter` to override auto-detection.
+    explicit `delimiter` to override auto-detection. For Excel workbooks that
+    aren't cleanly tabular, Cortex is used to locate and extract the real table.
     """
     name = uploaded.name.lower()
     data = uploaded.read()
+    st.session_state.pop("_excel_reshaped", None)
     if name.endswith((".xlsx", ".xlsm", ".xls")):
-        return pd.read_excel(BytesIO(data))
+        return _read_excel_smart(data, session=session)
 
     # Decode a sample to sniff the delimiter (unless one was supplied).
     text = data.decode("utf-8-sig", errors="replace")
@@ -892,11 +1306,14 @@ def build_prompt(attr: dict) -> str:
     samples = ", ".join(attr["samples"]) if attr["samples"] else "(none)"
     return (
         "You are helping migrate a legacy report to the strategic data model, a "
-        "medallion architecture: DATA_PRODUCT_CORE is GOLD (preferred) and "
-        "EDW_CORE is SILVER (fallback). Identify the single best matching column, "
-        "preferring a GOLD match and only falling back to SILVER when GOLD has "
-        "none. If the name is unclear, match on the SAMPLE VALUES using the "
-        "catalog's value_pattern and sample_values (value-based matching).\n\n"
+        "medallion architecture: DATA_PRODUCT_CORE is GOLD (preferred), "
+        "EDW_CORE is SILVER (fallback), and the *_RAW schemas in DATA_MARKETPLACE "
+        "are BRONZE (raw landing data, last resort). Identify the single best "
+        "matching column, preferring GOLD, then SILVER, then BRONZE only when the "
+        "attribute has no curated home — a BRONZE match means the data exists only "
+        "in raw and must be curated. If the name is unclear, match on the SAMPLE "
+        "VALUES using the catalog's value_pattern and sample_values "
+        "(value-based matching).\n\n"
         "IMPORTANT - expand common abbreviations when matching column names: "
         "PTY=PARTY, CTRY=COUNTRY, CCY=CURRENCY, CD=CODE, NM/NME=NAME, "
         "TOT=TOTAL, BS=BALANCE SHEET, AMT=AMOUNT, QTY=QUANTITY, DT=DATE, "
@@ -913,14 +1330,14 @@ def build_prompt(attr: dict) -> str:
         f"Data type: {attr['dtype']}\n"
         f"Sample values: {samples}\n\n"
         "Respond with ONLY a compact JSON object using these keys:\n"
-        '{"target_object": "<EDW_CORE.<TABLE> or DATA_PRODUCT_CORE.<TABLE>>", '
+        '{"target_object": "<EDW_CORE.<TABLE>, DATA_PRODUCT_CORE.<TABLE> or <RAW_SCHEMA>.<TABLE>>", '
         '"target_column": "<matching column name or null>", '
-        '"layer": "<GOLD or SILVER>", '
+        '"layer": "<GOLD, SILVER or BRONZE>", '
         '"match_basis": "<name|value|pattern>", '
         '"confidence": <0-100 integer>, '
         '"rationale": "<one short sentence>"}\n'
-        "Always report target_object as the physical schema.table (EDW_CORE or "
-        "DATA_PRODUCT_CORE), never a semantic view name."
+        "Always report target_object as the physical schema.table (EDW_CORE, "
+        "DATA_PRODUCT_CORE or a *_RAW schema), never a semantic view name."
     )
 
 
@@ -940,12 +1357,13 @@ def build_batch_prompt(profile: list[dict]) -> str:
     listing = "\n".join(lines)
     return (
         "You are helping migrate a legacy report to the strategic data model, a "
-        "medallion architecture: DATA_PRODUCT_CORE is GOLD (preferred) and "
-        "EDW_CORE is SILVER (fallback). For EACH legacy attribute below, identify "
-        "the single best matching column, preferring a GOLD match and only "
-        "falling back to SILVER when GOLD has none. If a name is unclear, match on "
-        "the sample values using the catalog's value_pattern and sample_values "
-        "(value-based matching).\n\n"
+        "medallion architecture: DATA_PRODUCT_CORE is GOLD (preferred), "
+        "EDW_CORE is SILVER (fallback), and the *_RAW schemas in DATA_MARKETPLACE "
+        "are BRONZE (raw landing data, last resort). For EACH legacy attribute "
+        "below, identify the single best matching column, preferring GOLD, then "
+        "SILVER, then BRONZE only when there is no curated home. If a name is "
+        "unclear, match on the sample values using the catalog's value_pattern "
+        "and sample_values (value-based matching).\n\n"
         "IMPORTANT - expand common abbreviations when matching: PTY=PARTY, "
         "CTRY=COUNTRY, CCY=CURRENCY, CD=CODE, NM/NME=NAME, TOT=TOTAL, "
         "BS=BALANCE SHEET, AMT=AMOUNT, QTY=QUANTITY, DT=DATE. e.g. 'PTY_TYPE' "
@@ -957,14 +1375,14 @@ def build_batch_prompt(profile: list[dict]) -> str:
         "Respond with ONLY a compact JSON array. Return exactly one object per "
         "legacy attribute, in the same order, using these keys:\n"
         '[{"legacy_attribute": "<echo the legacy name>", '
-        '"target_object": "<EDW_CORE.<TABLE> or DATA_PRODUCT_CORE.<TABLE>>", '
+        '"target_object": "<EDW_CORE.<TABLE>, DATA_PRODUCT_CORE.<TABLE> or <RAW_SCHEMA>.<TABLE>>", '
         '"target_column": "<matching column name or null>", '
-        '"layer": "<GOLD or SILVER>", '
+        '"layer": "<GOLD, SILVER or BRONZE>", '
         '"match_basis": "<name|value|pattern>", '
         '"confidence": <0-100 integer>, '
         '"rationale": "<one short sentence>"}]\n'
-        "Always report target_object as the physical schema.table (EDW_CORE or "
-        "DATA_PRODUCT_CORE), never a semantic view name."
+        "Always report target_object as the physical schema.table (EDW_CORE, "
+        "DATA_PRODUCT_CORE or a *_RAW schema), never a semantic view name."
     )
 
 
@@ -1435,8 +1853,11 @@ def _llm_pick_best(session, name: str, dtype: str, samples: list[str],
         "master-data entity (e.g. party, issuer, security, instrument, account) "
         "over an analytics / snapshot table. Only choose an analytics AS_OF / "
         "snapshot date when the legacy report is itself an analytics extract.\n"
-        "- Between two equally-good business matches, prefer GOLD (data product) "
-        "over SILVER (EDW), and a STRATEGIC source over a LEGACY (Phoenix) one.\n"
+        "- Between equally-good business matches, prefer GOLD (data product) "
+        "over SILVER (EDW) over BRONZE (raw), and a STRATEGIC source over a "
+        "LEGACY (Phoenix) one. A BRONZE/raw column is a valid last-resort match "
+        "when the attribute has no GOLD or SILVER home — it means the data "
+        "exists only in raw and must be curated.\n"
         "- If none is a genuine match, set index to -1.\n"
         "Confidence must be HONEST: 85-96 only with strong evidence (exact name "
         "or matching sample values); 55-75 for a solid name/subject match; "
@@ -2026,6 +2447,38 @@ def candidate_targets(session, name: str, samples: list[str] | None = None,
                     it["source_label"] = svc["label"]
         return items
 
+    def _apply_memory(items: list[dict]) -> list[dict]:
+        """Promote a previously-confirmed mapping to the top candidate.
+
+        If a human confirmed this (normalised) legacy name before, surface that
+        target first at high confidence, labelled so the user knows it comes
+        from an approved decision — never a hallucination, always a real column.
+        """
+        mem = load_confirmed_memory(session).get(_norm_legacy_name(name))
+        if not mem or not mem.get("column"):
+            return items
+        remembered = {
+            "layer": mem["layer"],
+            "object": mem["object"],
+            "column": mem["column"],
+            "data_type": "",
+            "description": "Previously confirmed mapping (approved by a reviewer).",
+            "confidence": 99,
+            "basis": "memory",
+            "classification": mem.get("classification", ""),
+            "service_codes": mem.get("source_label", ""),
+            "source_label": mem.get("source_label", ""),
+            "memory_hits": mem.get("hits", 1),
+        }
+        # Drop any duplicate of the remembered target from the ranked list, then
+        # place the remembered one first.
+        rest = [
+            c for c in items
+            if not (str(c.get("object", "")).upper() == mem["object"].upper()
+                    and str(c.get("column", "")).upper() == mem["column"].upper())
+        ]
+        return [remembered] + rest
+
     # 1) Semantic retrieval + rerank. Enrich the query with the inferred value
     # shape and a few example values so retrieval considers content, not just
     # the column name (the catalogue's SEARCH_TEXT indexes both).
@@ -2036,7 +2489,7 @@ def candidate_targets(session, name: str, samples: list[str] | None = None,
         ranked = _rerank_candidates(name, tokens, pattern, hits, top_n=top_n,
                                     samples=samples)
         if ranked:
-            return _backfill(ranked)
+            return _apply_memory(_backfill(ranked))[:top_n]
 
     # 2) Deterministic fallback: ILIKE scan of the catalogue.
     score_terms, where_terms = [], []
@@ -2111,7 +2564,7 @@ def candidate_targets(session, name: str, samples: list[str] | None = None,
                 "source_label": svc["label"],
             }
         )
-    return _backfill(out)
+    return _apply_memory(_backfill(out))[:top_n]
 
 
 # ------------------------------------------------------------------
@@ -2208,17 +2661,45 @@ def attach_candidates(session, mapping: pd.DataFrame) -> pd.DataFrame:
     mapping = mapping.copy().reset_index(drop=True)
     mapping["candidates"] = cand_col
 
-    # Promote a candidate where the agent gave no target.
+    # Promote a candidate where the agent gave no target — but only when it is
+    # strong enough to be worth presenting (>= WEAK_MATCH_FLOOR). A sub-floor
+    # top candidate is left unmapped (it still appears under alternates).
     for i, r in mapping.iterrows():
         tgt = str(r.get("target_attribute", "") or "").strip().lower()
         if (not tgt or tgt == "none") and cand_col[i]:
             top = cand_col[i][0]
-            mapping.at[i, "target_view"] = top["object"]
-            mapping.at[i, "target_attribute"] = top["column"]
-            mapping.at[i, "layer"] = top["layer"]
-            mapping.at[i, "match_basis"] = top["basis"]
-            mapping.at[i, "confidence"] = top["confidence"]
-            mapping.at[i, "rationale"] = "Suggested from catalogue (semantic match)."
+            if int(float(top.get("confidence", 0) or 0)) >= WEAK_MATCH_FLOOR:
+                mapping.at[i, "target_view"] = top["object"]
+                mapping.at[i, "target_attribute"] = top["column"]
+                mapping.at[i, "layer"] = top["layer"]
+                mapping.at[i, "match_basis"] = top["basis"]
+                mapping.at[i, "confidence"] = top["confidence"]
+                mapping.at[i, "rationale"] = (
+                    f"Best semantic match in {top['layer']} "
+                    f"({top['object']}.{top['column']})."
+                )
+
+    # Suppress sub-floor guesses: any target scoring below WEAK_MATCH_FLOOR is
+    # too weak to present as an answer. Blank the target (so the row reads "No
+    # confident match" and dispositions to source externally) while keeping the
+    # ranked candidates for manual review — we never discard the evidence.
+    for i, r in mapping.iterrows():
+        tgt = str(r.get("target_attribute", "") or "").strip().lower()
+        if r.get("is_override", False):
+            continue  # a manual override is authoritative regardless of score
+        try:
+            c = float(r.get("confidence", 0) or 0)
+        except (TypeError, ValueError):
+            c = 0.0
+        if tgt and tgt != "none" and c < WEAK_MATCH_FLOOR:
+            mapping.at[i, "target_view"] = ""
+            mapping.at[i, "target_attribute"] = ""
+            mapping.at[i, "layer"] = ""
+            mapping.at[i, "match_basis"] = ""
+            mapping.at[i, "rationale"] = (
+                f"No confident match — best candidate scored {int(c)}%, below the "
+                f"{WEAK_MATCH_FLOOR}% threshold. See suggested alternates or map manually."
+            )
 
     # Stamp each row with the source service code + strategic/legacy label of the
     # chosen target, so it is clear which service code the column maps to. We
@@ -2330,87 +2811,15 @@ def _apply_override(mapping: pd.DataFrame, legacy: str, obj: str, col: str,
     return out
 
 
-def render_editable_mapping(mapping: pd.DataFrame, key: str) -> pd.DataFrame:
-    """Slick read-only mapping grid + a cascading override panel. Returns the df.
-
-    The grid is presentation-only; overrides are made below via dependent
-    dropdowns (object -> column) sourced live from the catalogue, so a reviewer
-    can only pick real targets. Applying an override updates the mapping in
-    session state and reruns, so the grid reflects the change instantly.
+def render_override_panel(mapping: pd.DataFrame, key: str,
+                          state_key: str = "mapping") -> pd.DataFrame:
+    """Cascading remap control (object -> column) sourced live from the
+    catalogue, so a reviewer can only pick real targets. Applying an override
+    updates the mapping in session state (under ``state_key``) and reruns.
+    Returns the folded-back DataFrame. The visual overview lives in the unified
+    interactive table rendered by ``render_mapping_workspace``.
     """
-    import html as _html
-
-    def _src_summary(r) -> str:
-        # GOLD data products carry no service code, so their source is blank
-        # (implicitly strategic). SILVER shows the service code(s) it maps to.
-        if str(r.get("layer", "") or "").upper() == "GOLD":
-            return ""
-        return str(r.get("source_label", "") or "").strip()
-
-    # ---- Calm read-only grid ---------------------------------------------
-    head = (
-        '<div class="ghead"><div>Report Attribute</div><div>Mapped Column</div>'
-        '<div>Layer</div><div>EDW Source</div><div>Match</div><div>Status</div></div>'
-    )
-    rows_html = []
-    for _, r in mapping.iterrows():
-        legacy = _html.escape(str(r["legacy_attribute"]))
-        obj = str(r.get("target_view", "") or "").strip()
-        col = str(r.get("target_attribute", "") or "").strip()
-        if col and col.lower() != "none":
-            tgt = (f'<span class="tgt-col">{_html.escape(col)}</span>'
-                   f'<span class="tgt-obj">{_html.escape(obj)}</span>')
-        else:
-            tgt = '<span class="col-attr none">No match</span>'
-        layer = str(r.get("layer", "") or "").upper()
-        layer_html = (f'<span class="layer-badge {layer.lower()}">{layer}</span>'
-                      if layer in ("GOLD", "SILVER", "BRONZE") else '<span class="dash">—</span>')
-        # EDW source = the service code(s) only (GOLD data products carry none).
-        # No strategic/legacy wording here — this column is just the source code.
-        src_label = _src_summary(r)
-        if layer == "GOLD" or not src_label:
-            src_html = '<span class="dash">—</span>'
-        else:
-            codes = [c.strip() for c in src_label.split(",") if c.strip()]
-            shown = ", ".join(codes[:2])
-            extra = len(codes) - 2
-            more = (f' <span class="src-more" title="{_html.escape(src_label)}">'
-                    f'+{extra}</span>') if extra > 0 else ""
-            src_html = (f'<span class="src-codes" title="{_html.escape(src_label)}">'
-                        f'{_html.escape(shown)}</span>{more}')
-        # Match: how the target was found — value and/or pattern (else —).
-        basis = str(r.get("match_basis", "") or "").lower()
-        if basis == "both":
-            match_html = ('<span class="match-badge value">value</span>'
-                          '<span class="match-badge pattern">pattern</span>')
-        elif basis == "value":
-            match_html = '<span class="match-badge value">value</span>'
-        elif basis == "pattern":
-            match_html = '<span class="match-badge pattern">pattern</span>'
-        else:
-            match_html = '<span class="dash">—</span>'
-        status = str(r.get("status", "") or "").lower()
-        try:
-            cv = int(float(r["confidence"]))
-        except (TypeError, ValueError):
-            cv = 0
-        band = _band(cv)
-        status_html = (f'<span class="status-pill {status}">{status or "—"}</span>'
-                       f' <span class="conf {band}"><span class="dot"></span>{cv}%</span>')
-        is_ovr = bool(r.get("is_override", False))
-        ovr_tag = '<span class="ovr-tag">override</span>' if is_ovr else ""
-        rows_html.append(
-            f'<div class="grow{" ovr" if is_ovr else ""}">'
-            f'<div class="col-src">{legacy}{ovr_tag}</div>'
-            f'<div class="col-ds">{tgt}</div>'
-            f'<div>{layer_html}</div><div>{src_html}</div>'
-            f'<div>{match_html}</div>'
-            f'<div>{status_html}</div></div>'
-        )
-    st.markdown(f'<div class="grid map5">{head}{"".join(rows_html)}</div>',
-                unsafe_allow_html=True)
-
-    # ---- Slick cascading override panel (object -> column) ----------------
+    # ---- Cascading override panel (object -> column) ----------------------
     targets = _catalog_targets(get_session())
     if targets["objects"]:
         # Reset dependent selections when a parent changes, so switching layer
@@ -2422,7 +2831,12 @@ def render_editable_mapping(mapping: pd.DataFrame, key: str) -> pd.DataFrame:
         def _reset_col():
             st.session_state.pop(f"{key}_ov_col", None)
 
-        with st.expander("✏️  Override a mapping — pick object, then column", expanded=False):
+        with st.expander("✏️  Remap an attribute — pick object, then column", expanded=False):
+            st.caption(
+                "Pick the correct target below. When you **confirm** this run, your "
+                "overrides are learned into the mapping memory and suggested "
+                "automatically for the same attribute next time."
+            )
             # Row 1: which legacy column, and the layer filter.
             r1 = st.columns([2, 1])
             legacy_choice = r1[0].selectbox(
@@ -2466,7 +2880,7 @@ def render_editable_mapping(mapping: pd.DataFrame, key: str) -> pd.DataFrame:
                 disabled=not (obj_choice and col_choice),
             )
             if apply_ov:
-                st.session_state["mapping"] = _apply_override(
+                st.session_state[state_key] = _apply_override(
                     mapping, legacy_choice, obj_choice, col_choice, targets)
                 st.rerun()
 
@@ -2479,6 +2893,212 @@ def render_editable_mapping(mapping: pd.DataFrame, key: str) -> pd.DataFrame:
         map_status(r["confidence"], r["target_attribute"]) for _, r in out.iterrows()
     ]
     return out
+
+
+def render_mapping_workspace(mapping: pd.DataFrame, *, key_prefix: str,
+                             source_name: str, source_file: str = "",
+                             row_count: int = 0, run_id: str | None = None,
+                             state_key: str | None = None) -> pd.DataFrame:
+    """Shared post-mapping workspace used by BOTH the live upload flow and the
+    re-opened Historic Run, so a saved run has the full feature set: editable
+    grid + cascading override, ranked alternates, the action register
+    (owner / decision / notes) and save/export.
+
+    When ``run_id`` is provided, saving updates that run *in place* (same
+    RUN_ID). Returns the possibly-edited mapping DataFrame.
+    """
+    state_key = state_key or f"{key_prefix}_wsmap"
+
+    # ---- Headline callouts: learned matches + weak/no-match transparency ---
+    basis_series = mapping.get("match_basis", pd.Series([""] * len(mapping))).astype(str).str.lower()
+    n_learned = int((basis_series == "memory").sum())
+    tgt_series = mapping.get("target_attribute", pd.Series([""] * len(mapping))).astype(str)
+    n_nomatch = int(((tgt_series.str.strip() == "") | (tgt_series.str.lower() == "none")).sum())
+    callouts = []
+    if n_learned:
+        callouts.append(
+            f"🧠 **{n_learned}** mapping(s) came from **confirmed memory** "
+            "(previously approved by a reviewer)."
+        )
+    if n_nomatch:
+        callouts.append(
+            f"⚠️ **{n_nomatch}** attribute(s) had **no confident match** "
+            f"(below the {WEAK_MATCH_FLOOR}% threshold) — review the alternates or "
+            "map them manually; confident guesses are never invented."
+        )
+    if callouts:
+        st.info("  \n".join(callouts))
+
+    mapping = mapping.reset_index(drop=True)
+
+    # ---- One unified, interactive mapping table ---------------------------
+    # Replaces the old read-only grid + separate action register (which showed
+    # the same rows twice). Native st.data_editor keeps every column perfectly
+    # aligned, and the reviewer edits Decision / Owner / Notes inline.
+    def _target_str(r) -> str:
+        o = str(r.get("target_view", "") or "").strip()
+        c = str(r.get("target_attribute", "") or "").strip()
+        return f"{o}.{c}" if c and c.lower() != "none" else "— No match"
+
+    def _match_label(r) -> str:
+        c = str(r.get("target_attribute", "") or "").strip()
+        if not c or c.lower() == "none":
+            return "—"
+        return {
+            "memory": "🧠 Learned", "manual": "✏️ Manual",
+            "both": "Value + shape", "value": "Value", "pattern": "Shape",
+        }.get(str(r.get("match_basis", "") or "").lower(), "Semantic")
+
+    def _status_label(s) -> str:
+        return {"mapped": "✅ Mapped", "review": "🟠 Review",
+                "unmapped": "🔴 Unmapped"}.get(str(s or "").lower(), "—")
+
+    disp_full = pd.DataFrame({
+        "Attribute": mapping["legacy_attribute"].astype(str),
+        "Suggested target": [_target_str(r) for _, r in mapping.iterrows()],
+        "Layer": [str(l or "").upper() or "—" for l in mapping.get("layer", "")],
+        "Match": [_match_label(r) for _, r in mapping.iterrows()],
+        "Confidence": pd.to_numeric(mapping["confidence"], errors="coerce").fillna(0).astype(int),
+        "Status": [_status_label(s) for s in mapping.get("status", "")],
+        "Recommended action": mapping.get("disposition", ""),
+        "Why": [_match_reason(r) for _, r in mapping.iterrows()],
+        "Decision": (mapping.get("decision", "Pending").fillna("Pending")
+                     if "decision" in mapping else ["Pending"] * len(mapping)),
+        "Owner": mapping.get("owner", "").fillna("") if "owner" in mapping else [""] * len(mapping),
+        "Notes": mapping.get("notes", "").fillna("") if "notes" in mapping else [""] * len(mapping),
+    }, index=mapping.index)
+
+    # Interactive status filter — keeps the table focused without a second grid.
+    status_l = mapping.get("status", pd.Series([""] * len(mapping))).astype(str).str.lower()
+    counts = {
+        "All": len(mapping),
+        "Needs review": int((status_l == "review").sum()),
+        "Unmapped": int((status_l == "unmapped").sum()),
+        "Mapped": int((status_l == "mapped").sum()),
+    }
+    fkey = f"{key_prefix}_filter"
+    choice = st.radio(
+        "Show", options=list(counts),
+        format_func=lambda k: f"{k} ({counts[k]})",
+        horizontal=True, key=fkey, label_visibility="collapsed",
+    )
+    if choice == "Needs review":
+        mask = status_l == "review"
+    elif choice == "Unmapped":
+        mask = status_l == "unmapped"
+    elif choice == "Mapped":
+        mask = status_l == "mapped"
+    else:
+        mask = pd.Series([True] * len(mapping), index=mapping.index)
+    disp = disp_full[mask.values]
+
+    edited_tbl = st.data_editor(
+        disp,
+        key=f"{key_prefix}_table",
+        hide_index=True,
+        use_container_width=True,
+        height=min(620, 120 + 42 * max(1, len(disp))),
+        disabled=["Attribute", "Suggested target", "Layer", "Match",
+                  "Confidence", "Status", "Recommended action", "Why"],
+        column_config={
+            "Attribute": st.column_config.TextColumn("Attribute", width="medium"),
+            "Suggested target": st.column_config.TextColumn("Suggested target", width="large"),
+            "Layer": st.column_config.TextColumn("Layer", width="small"),
+            "Match": st.column_config.TextColumn("Match", width="small",
+                help="How this target was found: 🧠 Learned (confirmed memory), "
+                     "✏️ Manual, Value/Shape (data evidence), or Semantic."),
+            "Confidence": st.column_config.ProgressColumn(
+                "Confidence", min_value=0, max_value=100, format="%d%%"),
+            "Status": st.column_config.TextColumn("Status", width="small"),
+            "Recommended action": st.column_config.TextColumn(
+                "Recommended action", width="medium",
+                help="What to do to make this attribute usable in the strategic model."),
+            "Why": st.column_config.TextColumn("Why", width="large",
+                help="Plain-English reason for the match."),
+            "Decision": st.column_config.SelectboxColumn(
+                "Decision", options=DECISION_VALUES, required=True, width="small",
+                help="Your call — saved with the run."),
+            "Owner": st.column_config.TextColumn("Owner", width="small"),
+            "Notes": st.column_config.TextColumn("Notes", width="medium"),
+        },
+    )
+    # Fold the editable fields back onto the full mapping, by index.
+    for idx in edited_tbl.index:
+        mapping.at[idx, "decision"] = edited_tbl.at[idx, "Decision"]
+        mapping.at[idx, "owner"] = edited_tbl.at[idx, "Owner"]
+        mapping.at[idx, "notes"] = edited_tbl.at[idx, "Notes"]
+    st.session_state[state_key] = mapping
+
+    # ---- Remap control (cascading object -> column) -----------------------
+    mapping = render_override_panel(
+        mapping, key=f"{key_prefix}_editor", state_key=state_key)
+    st.session_state[state_key] = mapping
+
+    # ---- Ranked alternates for review / unmapped columns ------------------
+    needs = mapping[mapping["status"].isin(["review", "unmapped"])]
+    if not needs.empty:
+        with st.expander(f"Suggested alternates for {len(needs)} attribute(s) to review"):
+            for _, r in needs.iterrows():
+                cands = r.get("candidates", []) or []
+                st.markdown(
+                    f'**{r["legacy_attribute"]}** '
+                    f'<span style="color:var(--muted)">→ current: '
+                    f'{r["target_view"] or "—"}.{r["target_attribute"] or "—"}</span>',
+                    unsafe_allow_html=True,
+                )
+                if cands:
+                    alt = pd.DataFrame([
+                        {
+                            "Layer": c["layer"], "Object": c["object"],
+                            "Column": c["column"], "Type": c["data_type"],
+                            "Source": c.get("source_label", ""),
+                            "Confidence": c["confidence"],
+                            "Description": c["description"][:80],
+                        }
+                        for c in cands
+                    ])
+                    st.dataframe(alt, hide_index=True, use_container_width=True)
+                else:
+                    st.caption("No catalogue candidates found — map manually above.")
+
+    st.session_state[state_key] = mapping
+
+    # ---- Save to history + export -----------------------------------------
+    c1, c2 = st.columns([1, 1])
+    saved_id = st.session_state.get(f"{key_prefix}_saved")
+    is_update = bool(run_id)
+    save_label = "Save changes" if is_update else "Save mapping run"
+    with c1:
+        if saved_id and not is_update:
+            st.success(f"Saved to history · run {saved_id[:8]}")
+        elif st.button(save_label, key=f"{key_prefix}_save", type="primary",
+                       use_container_width=True):
+            session = get_session()
+            rid = save_mapping_run(
+                session,
+                report_name=source_name,
+                source_file=source_file or source_name,
+                row_count=row_count,
+                mapping=mapping,
+                run_id=run_id,
+            )
+            if rid:
+                st.session_state[f"{key_prefix}_saved"] = rid
+                st.toast("Changes saved." if is_update else "Mapping run saved.")
+                st.rerun()
+    with c2:
+        base = str(source_name or "report").rsplit(".", 1)[0]
+        export_cols = [c for c in mapping.columns if c != "candidates"]
+        csv = mapping[export_cols].to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "Export mapping (CSV)",
+            data=csv,
+            file_name=f"mapping_{base}.csv",
+            mime="text/csv",
+            key=f"{key_prefix}_dl",
+            use_container_width=True,
+        )
+    return mapping
 
 
 # ------------------------------------------------------------------
@@ -2544,10 +3164,16 @@ def run_mapping_flow(uploaded, key_prefix: str, show_delimiter: bool = True) -> 
         override = labels[choice]
 
     try:
-        df = read_report(uploaded, delimiter=override)
+        df = read_report(uploaded, delimiter=override, session=get_session())
     except Exception as exc:  # noqa: BLE001
         st.error(f"Could not read the file: {exc}")
         return
+
+    if st.session_state.get("_excel_reshaped"):
+        st.caption(
+            "📐 This workbook wasn't cleanly tabular, so Cortex located and "
+            "extracted the data table for you. Check the columns below look right."
+        )
 
     profile = attribute_profile(df)
     sig = f"{uploaded.name}:{df.shape[0]}x{df.shape[1]}:{override}"
@@ -2633,112 +3259,21 @@ def run_mapping_flow(uploaded, key_prefix: str, show_delimiter: bool = True) -> 
         unsafe_allow_html=True,
     )
     st.caption(
-        "Machine-suggested targets, GOLD first then SILVER. To change any row, "
-        "use the override panel below — changes apply instantly and are flagged "
-        "and saved to history."
+        "One row per report attribute, matched across the medallion layers — GOLD "
+        "(Data Product) first, then SILVER (EDW), then BRONZE (Raw). Filter by "
+        "status, see why each match was made, and edit the Decision, Owner and "
+        "Notes inline. Use **Remap an attribute** to pick a different target."
     )
-    edited = render_editable_mapping(mapping, key=f"{key_prefix}_editor")
+    edited = render_mapping_workspace(
+        mapping,
+        key_prefix=key_prefix,
+        source_name=st.session_state.get("source_name", uploaded.name),
+        source_file=uploaded.name,
+        row_count=st.session_state.get("source_rows", df.shape[0]),
+        run_id=None,
+        state_key="mapping",
+    )
     st.session_state["mapping"] = edited
-    mapping = edited
-
-    # ---- Ranked alternates for review / unmapped columns ------------------
-    needs = mapping[mapping["status"].isin(["review", "unmapped"])]
-    if not needs.empty:
-        with st.expander(f"Suggested alternates for {len(needs)} column(s) to review"):
-            for _, r in needs.iterrows():
-                cands = r.get("candidates", []) or []
-                st.markdown(
-                    f'**{r["legacy_attribute"]}** '
-                    f'<span style="color:var(--muted)">→ current: '
-                    f'{r["target_view"] or "—"}.{r["target_attribute"] or "—"}</span>',
-                    unsafe_allow_html=True,
-                )
-                if cands:
-                    alt = pd.DataFrame([
-                        {
-                            "Layer": c["layer"], "Object": c["object"],
-                            "Column": c["column"], "Type": c["data_type"],
-                            "Source": c.get("source_label", ""),
-                            "Confidence": c["confidence"],
-                            "Description": c["description"][:80],
-                        }
-                        for c in cands
-                    ])
-                    st.dataframe(alt, hide_index=True, use_container_width=True)
-                else:
-                    st.caption("No catalogue candidates found — map manually above.")
-
-    # ---- Actionable review register ---------------------------------------
-    st.markdown('<div class="subhead">Action register</div>', unsafe_allow_html=True)
-    st.caption(
-        "One row per report attribute with the action required. Set an Owner, a "
-        "Decision and Notes — these save with the run and export to CSV."
-    )
-    reg = pd.DataFrame({
-        "Report Attribute": mapping["legacy_attribute"],
-        "Found In": mapping.get("found_in", ""),
-        "Target": [
-            (f"{o}.{c}" if str(c or "").strip() and str(c).lower() != "none" else "—")
-            for o, c in zip(mapping.get("target_view", ""), mapping.get("target_attribute", ""))
-        ],
-        "Confidence": pd.to_numeric(mapping["confidence"], errors="coerce").fillna(0).astype(int),
-        "Disposition": mapping.get("disposition", ""),
-        "Owner": mapping.get("owner", ""),
-        "Decision": mapping.get("decision", "Pending").fillna("Pending")
-        if "decision" in mapping else ["Pending"] * len(mapping),
-        "Notes": mapping.get("notes", ""),
-    })
-    reg_edited = st.data_editor(
-        reg,
-        key=f"{key_prefix}_register",
-        hide_index=True,
-        use_container_width=True,
-        disabled=["Report Attribute", "Found In", "Target", "Confidence", "Disposition"],
-        column_config={
-            "Decision": st.column_config.SelectboxColumn(
-                "Decision", options=DECISION_VALUES, required=True, width="small",
-            ),
-            "Owner": st.column_config.TextColumn("Owner", width="small"),
-            "Notes": st.column_config.TextColumn("Notes", width="large"),
-        },
-    )
-    # Fold reviewer inputs back onto the mapping so they persist + export.
-    mapping["owner"] = reg_edited["Owner"].values
-    mapping["decision"] = reg_edited["Decision"].values
-    mapping["notes"] = reg_edited["Notes"].values
-    st.session_state["mapping"] = mapping
-
-    # ---- Save to history + export -----------------------------------------
-    c1, c2 = st.columns([1, 1])
-    saved_id = st.session_state.get(f"{key_prefix}_saved")
-    with c1:
-        if saved_id:
-            st.success(f"Saved to history · run {saved_id[:8]}")
-        elif st.button("Save mapping run", key=f"{key_prefix}_save", type="primary",
-                       use_container_width=True):
-            session = get_session()
-            rid = save_mapping_run(
-                session,
-                report_name=st.session_state.get("source_name", uploaded.name),
-                source_file=uploaded.name,
-                row_count=st.session_state.get("source_rows", df.shape[0]),
-                mapping=mapping,
-            )
-            if rid:
-                st.session_state[f"{key_prefix}_saved"] = rid
-                st.rerun()
-    with c2:
-        base = st.session_state.get("source_name", "report").rsplit(".", 1)[0]
-        export_cols = [c for c in mapping.columns if c != "candidates"]
-        csv = mapping[export_cols].to_csv(index=False).encode("utf-8")
-        st.download_button(
-            "Export mapping (CSV)",
-            data=csv,
-            file_name=f"mapping_{base}.csv",
-            mime="text/csv",
-            key=f"{key_prefix}_dl",
-            use_container_width=True,
-        )
 
 
 # ==================================================================
@@ -2750,12 +3285,13 @@ if view == "Home":
         '<div class="eyebrow">Legacy Report Mapping</div>'
         '<h1>Map legacy reports to the strategic data model</h1>'
         '<p>Upload a legacy report — or check a single attribute — and let Cortex '
-        'match every column to its authoritative home in the strategic layers, '
-        'preferring GOLD (Data Product) then SILVER (EDW). Review, confirm and '
-        'keep a full history of what has been mapped.</p>'
+        'match every column to its authoritative home across the medallion layers, '
+        'preferring GOLD (Data Product), then SILVER (EDW), then BRONZE (Raw) — so '
+        'columns that live only in raw are still found and flagged for curation. '
+        'Review, confirm and keep a full history of what has been mapped.</p>'
         '<div class="stat-grid">'
-        '<div class="stat"><div class="v">GOLD &rarr; SILVER</div><div class="k">Match priority</div></div>'
-        '<div class="stat"><div class="v">7,810</div><div class="k">Target columns</div></div>'
+        '<div class="stat"><div class="v">GOLD &rarr; SILVER &rarr; BRONZE</div><div class="k">Match priority</div></div>'
+        '<div class="stat"><div class="v">152k+</div><div class="k">Columns indexed</div></div>'
         '<div class="stat"><div class="v">Cortex</div><div class="k">Matching engine</div></div>'
         '<div class="stat"><div class="v">Saved</div><div class="k">Run history</div></div>'
         '</div></div>',
@@ -2844,21 +3380,36 @@ elif view == "Single Attribute":
             cands = candidate_targets(session, attr["attribute"], attr["samples"], top_n=5)
         if cands:
             top = cands[0]
-            row = {
-                "legacy_attribute": attr["attribute"],
-                "target_view": top["object"],
-                "target_attribute": top["column"],
-                "layer": top["layer"],
-                "match_basis": top["basis"],
-                "confidence": top["confidence"],
-                "classification": top.get("classification", ""),
-                "source_label": top.get("source_label", ""),
-                "rationale": (
-                    f"Best semantic match in {top['layer']} "
-                    f"({top['object']}.{top['column']})."
-                    + (f" Source: {top['source_label']}." if top.get('source_label') else "")
-                ),
-            }
+            top_conf = int(float(top.get("confidence", 0) or 0))
+            if top_conf >= WEAK_MATCH_FLOOR:
+                row = {
+                    "legacy_attribute": attr["attribute"],
+                    "target_view": top["object"],
+                    "target_attribute": top["column"],
+                    "layer": top["layer"],
+                    "match_basis": top["basis"],
+                    "confidence": top["confidence"],
+                    "classification": top.get("classification", ""),
+                    "source_label": top.get("source_label", ""),
+                    "rationale": (
+                        f"Best semantic match in {top['layer']} "
+                        f"({top['object']}.{top['column']})."
+                        + (f" Source: {top['source_label']}." if top.get('source_label') else "")
+                    ),
+                }
+            else:
+                # Too weak to present as an answer — show no match, but keep the
+                # ranked candidates below so the user can judge for themselves.
+                row = {
+                    "legacy_attribute": attr["attribute"],
+                    "target_view": "", "target_attribute": "",
+                    "layer": "", "match_basis": "", "confidence": top_conf,
+                    "rationale": (
+                        f"No confident match — best candidate scored {top_conf}%, "
+                        f"below the {WEAK_MATCH_FLOOR}% threshold. See the ranked "
+                        "candidates below, or add sample values to sharpen the match."
+                    ),
+                }
         else:
             row = {
                 "legacy_attribute": attr["attribute"],
@@ -2907,7 +3458,12 @@ elif view == "Reports":
     # Detail view for a selected run.
     open_run = st.session_state.get("open_run")
     if open_run:
+        ws_prefix = f"reports_{open_run}"
+        ws_state = f"{ws_prefix}_wsmap"
         if st.button("← Back to all runs", key="reports_back"):
+            # Drop the per-run working state so re-opening reloads fresh.
+            for k in (ws_state, f"{ws_prefix}_saved"):
+                st.session_state.pop(k, None)
             st.session_state.pop("open_run", None)
             st.rerun()
         meta = st.session_state.get("open_run_meta", {})
@@ -2916,34 +3472,68 @@ elif view == "Reports":
             f'{meta.get("status", "draft").upper()}</div>',
             unsafe_allow_html=True,
         )
-        detail = load_mapping_run(session, open_run)
-        if detail.empty:
-            st.info("No stored results for this run.")
-        else:
-            grid = detail.rename(columns={
-                "LEGACY_COLUMN": "legacy_attribute",
-                "TARGET_COLUMN": "target_attribute",
-                "TARGET_OBJECT": "target_view",
-                "TARGET_LAYER": "layer",
-                "MATCH_BASIS": "match_basis",
-                "CONFIDENCE": "confidence",
-            })
-            render_mapping_grid(grid)
-            cc1, cc2 = st.columns([1, 1])
-            with cc1:
-                if meta.get("status") != "confirmed" and st.button(
-                    "Mark as confirmed", key="reports_confirm", type="primary",
-                    use_container_width=True):
-                    update_run_status(session, open_run, "confirmed")
-                    st.session_state["open_run_meta"]["status"] = "confirmed"
-                    st.rerun()
-            with cc2:
-                csv = grid.to_csv(index=False).encode("utf-8")
-                st.download_button(
-                    "Export (CSV)", data=csv,
-                    file_name=f"mapping_{meta.get('name','report')}.csv",
-                    mime="text/csv", key="reports_dl", use_container_width=True,
+        st.caption(
+            "Re-open a saved run with the full workspace — filter and review the "
+            "mapping table, remap any attribute, check suggested alternates, and "
+            "update decisions, owners and notes. **Save changes** updates this same run."
+        )
+        # Seed the editable mapping once; thereafter keep edits across reruns.
+        if ws_state not in st.session_state:
+            detail = load_mapping_run(session, open_run)
+            if detail.empty:
+                st.info("No stored results for this run.")
+                st.session_state[ws_state] = pd.DataFrame()
+            else:
+                st.session_state[ws_state] = _run_to_mapping(detail)
+        work = st.session_state.get(ws_state)
+        if work is not None and not work.empty:
+            # ---- Run-level actions (status is a property of the whole run) ---
+            cur_status = meta.get("status", "draft")
+            n_learn = int(work.get("is_override", pd.Series([False] * len(work))).fillna(False).astype(bool).sum())
+            if cur_status == "confirmed":
+                st.success(
+                    f"✅ This run is **confirmed**. Its {n_learn} manual override(s) "
+                    "have been learned into the mapping memory and will be suggested "
+                    "automatically next time."
                 )
+            a1, a2, a3 = st.columns([1, 1, 1])
+            with a1:
+                if cur_status != "confirmed":
+                    if st.button("✅ Mark as confirmed", key="reports_confirm",
+                                 type="primary", use_container_width=True):
+                        update_run_status(session, open_run, "confirmed")
+                        st.session_state["open_run_meta"]["status"] = "confirmed"
+                        st.toast("Run confirmed — overrides learned.")
+                        st.rerun()
+                else:
+                    if st.button("↩︎ Revert to draft", key="reports_unconfirm",
+                                 use_container_width=True,
+                                 help="Unconfirm this run and retract its learned mappings."):
+                        update_run_status(session, open_run, "draft")
+                        st.session_state["open_run_meta"]["status"] = "draft"
+                        st.toast("Reverted to draft — learned mappings retracted.")
+                        st.rerun()
+            with a2:
+                confirm_del = st.checkbox("Confirm delete", key="reports_del_chk",
+                                          help="Tick to enable permanent deletion.")
+            with a3:
+                if st.button("🗑 Delete run", key="reports_delete",
+                             disabled=not confirm_del, use_container_width=True):
+                    if delete_mapping_run(session, open_run):
+                        for k in (ws_state, f"{ws_prefix}_saved", "reports_del_chk"):
+                            st.session_state.pop(k, None)
+                        st.session_state.pop("open_run", None)
+                        st.toast("Run deleted.")
+                        st.rerun()
+            render_mapping_workspace(
+                work,
+                key_prefix=ws_prefix,
+                source_name=meta.get("name", "report"),
+                source_file=meta.get("name", "report"),
+                row_count=len(work),
+                run_id=open_run,
+                state_key=ws_state,
+            )
     else:
         hc1, hc2 = st.columns([5, 1])
         with hc2:
@@ -3004,6 +3594,24 @@ elif view == "Reports":
                             "name": r["REPORT_NAME"], "status": status,
                         }
                         st.rerun()
+                    rid = r["RUN_ID"]
+                    pend = st.session_state.get("_del_pending")
+                    if pend == rid:
+                        if st.button("Confirm delete", key=f"delok_{rid}",
+                                     type="primary", use_container_width=True):
+                            if delete_mapping_run(session, rid):
+                                st.session_state.pop("_del_pending", None)
+                                st.toast("Run deleted.")
+                                st.rerun()
+                        if st.button("Cancel", key=f"delno_{rid}",
+                                     use_container_width=True):
+                            st.session_state.pop("_del_pending", None)
+                            st.rerun()
+                    else:
+                        if st.button("Delete", key=f"del_{rid}",
+                                     use_container_width=True):
+                            st.session_state["_del_pending"] = rid
+                            st.rerun()
 
 elif view == "How it works":
     st.markdown(
